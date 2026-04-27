@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Invoice-{{ invoice.issue_date|date:"d-m-Y" }}</title>
+
+    <style>
+        @page {
+            size: A4 portrait;
+            margin: 12mm;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            font-size: 10px;
+            color: #000;
+            margin: 0;
+            padding: 0;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            border: 1px solid #000;
+            padding: 3px;
+            vertical-align: top;
+        }
+
+        th {
+            font-size: 8px;
+            font-weight: bold;
+            text-align: center;
+        }
+
+        td {
+            font-size: 8px;
+            line-height: 1.2;
+        }
+
+        .small {
+            font-size: 7px;
+            line-height: 1.2;
+        }
+
+        .text-center { text-align: center; }
+        .text-right { text-align: right; }
+
+        .company-header {
+            text-align: center;
+            margin-bottom: 10px;
+        }
+
+        .company-name {
+            font-size: 22px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .company-text {
+            font-size: 10px;
+            line-height: 1.3;
+        }
+
+        .doc-title {
+            text-align: center;
+            font-size: 13px;
+            font-weight: bold;
+            margin: 8px 0 10px 0;
+        }
+
+        .spacer { height: 6px; }
+
+        .summary-table { margin-top: 10px; }
+
+        .signature-wrapper {
+            margin-top: 50px;
+            text-align: right;
+        }
+
+        .signature-label {
+            font-weight: bold;
+            margin-top: 4px;
+        }
+
+        .footer {
+            margin-top: 15px;
+            text-align: center;
+            font-size: 10px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+<body>
+
+    <!-- HEADER -->
+    <div class="company-header" style="text-align:center; margin-bottom:5px;">
+        <div class="company-name" style="font-size:22px; font-weight:bold; text-transform:uppercase; margin:0; padding:0; line-height:1.1;">
+            Impala Logistics
+        </div>
+
+        <div class="company-text" style="font-size:10px; margin:0; padding:0; line-height:1.1;">
+            2nd Floor City Tower, Opp. Genexx Exotica, Kumarpur, Asansol-713304, West Bengal
+        </div>
+
+        <div class="company-text" style="font-size:10px; margin:0; padding:0; line-height:1.1;">
+            GSTIN - 19BJQPS7761G1ZC
+        </div>
+    </div>
+
+
+    <div class="doc-title" style="margin-bottom:15px;">Invoice</div>
+
+    <!-- BILL TO SECTION (NO TABLE) -->
+    <div style="font-size:9px; line-height:1.3; margin-bottom:12px;">
+        <strong>Bill To:</strong><br>
+        <span style="font-size:10px;"><strong>{{ bill_to_party|default:"-" }}</strong></span><br>
+        {{ bill_to_address|default:"-" }}<br>
+        {% if bill_to_gst %}
+            <strong>GSTIN:</strong> {{ bill_to_gst }}
+        {% endif %}
+    </div>
+
+
+        <div class="spacer"></div>
+
+
+    <div class="spacer"></div>
+
+    <div class="spacer"></div>
+
+
+    <!-- INVOICE META -->
+    <table>
+        <tr>
+            <td width="50%"><strong>Invoice ID:</strong> {{ invoice.invoice_id|default:"-" }}</td>
+            <td width="50%"><strong>Shipment:</strong> {{ shipment.shipment_id|default:"-" }}</td>
+        </tr>
+        <tr>
+            <td><strong>Issue Date:</strong> {{ invoice.issue_date|date:"d-m-Y" }}</td>
+            <td><strong>Driver:</strong>
+                {% if shipment.driver %}
+                    {{ shipment.driver.first_name }} {{ shipment.driver.last_name }}
+                {% else %}
+                    -
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <td><strong>Vehicle No:</strong>
+                {% if shipment.vehicle %}
+                    {{ shipment.vehicle.registration_number }}
+                {% else %}
+                    -
+                {% endif %}
+            </td>
+            <td><strong>Consignor/Consignee Invoice No:</strong>
+                {% if invoice.invoice_ref %}
+                    {{ invoice.invoice_ref }}
+                {% else %}
+                    -
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+
+            <td><strong>LR No:</strong> {{ shipment.lr_no|default:"-" }}</td>
+        </tr>
+    </table>
+
+    <div class="spacer"></div>
+
+    <!-- CONSIGNMENT TABLE -->
+    <table>
+        <thead>
+            <tr>
+                <th width="4%">Sl</th>
+                <th width="18%">Consignor</th>
+                <th width="16%">Consignee</th>
+                <th width="13%">From</th>
+                <th width="13%">To</th>
+                <th width="10%">Item</th>
+                <th width="6%">Pkg</th>
+                <th width="6%">Wt</th>
+                <th width="6%">Rate</th>
+                <th width="8%">Freight</th>
+            </tr>
+        </thead>
+
+        <tbody>
+            {% for c in consignments %}
+            <tr>
+                <td class="text-center">{{ forloop.counter }}</td>
+
+                <td class="small">
+                    <strong>{{ c.consignor.organization_name|default:"-" }}</strong><br>
+                    {{ c.consignor_address|default:"" }}
+                </td>
+
+                <td class="small">
+                    <strong>{{ c.consignee.organization_name|default:"-" }}</strong><br>
+                    {{ c.consignee_address|default:"" }}
+                </td>
+
+                <td>{{ c.from_location|default:"-" }}</td>
+                <td>{{ c.to_location|default:"-" }}</td>
+
+                <td>{{ c.material_type|default:"-" }}</td>
+
+                <td class="text-center">{{ c.number_of_packages|default:"-" }}</td>
+
+                <td class="text-center">
+                    {% if c.weight %}
+                        {{ c.weight }} {{ c.weight_unit }}
+                    {% else %}
+                        -
+                    {% endif %}
+                </td>
+
+                <td class="text-center">
+                    {% if c.rate %}
+                        {{ c.rate }}
+                    {% else %}
+                        -
+                    {% endif %}
+                </td>
+
+                <td class="text-center">
+                    {% if c.total_freight %}
+                        {{ c.total_freight }}
+                    {% else %}
+                        To Be billed
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <div class="spacer"></div>
+
+    <!-- FINANCIAL SUMMARY -->
+    <table class="summary-table">
+        <tr>
+            <td width="70%"><strong>Total Freight</strong></td>
+            <td width="30%" class="text-right">{{ invoice.total_freight|default:"0.00" }}</td>
+        </tr>
+        <tr>
+            <td><strong>Detention Amount</strong></td>
+            <td class="text-right">{{ invoice.detention_amount|default:"0.00" }}</td>
+        </tr>
+        <tr>
+            <td><strong>Advance Received</strong></td>
+            <td class="text-right">{{ shipment.freight_advance|default:"0.00" }}</td>
+        </tr>
+        <tr>
+            <td><strong>Driver Advances</strong></td>
+            <td class="text-right">{{ breakdown.financial_breakdown.driver_advances|default:"0.00" }}</td>
+        </tr>
+        <tr>
+            <td><strong>Payment</strong></td>
+            <td class="text-right">{{ invoice.payment_received|default:"0.00" }}</td>
+        </tr>
+        <tr>
+            <td><strong>To Pay</strong></td>
+            <td class="text-right">{{ invoice.total_dues|default:"0.00" }}</td>
+        </tr>
+    </table>
+
+     <!-- PAY TO + SIGNATURE SIDE BY SIDE -->
+    <div style="width:100%; margin-top:20px;">
+
+        <!-- LEFT SIDE: PAY TO -->
+        <div style="width:55%; float:left; font-size:9px; line-height:1.3; vertical-align:top;">
+            <strong>Pay To:</strong><br>
+            <strong>Account No.:</strong> 192605000599<br>
+            <strong>IFSC:</strong> ICIC0001926<br>
+            <strong>PAN:</strong> BJQPS7761G<br>
+        </div>
+
+        <!-- RIGHT SIDE: SIGNATURE -->
+        <div style="width:40%; float:right; text-align:right; vertical-align:top;">
+            {% if signature_uri %}
+                <img src="{{ signature_uri }}" width="100" height="38" alt="Authorized Signature" style="margin:0; padding:0;">
+            {% endif %}
+            <div style="font-weight:bold; margin-top:2px;">Authorized Signature</div>
+        </div>
+
+        <div style="clear:both;"></div>
+    </div>
+    <div class="footer">
+        **All Disputes subjects to Asansol Jurisdiction
+    </div>
+
+
+
+</body>
+</html>

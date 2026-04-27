@@ -1,0 +1,26 @@
+.submit-row.custom-submit-row {
+    display: flex !important;
+    align-items: center !important;
+    gap: 10px !important;
+}
+
+.submit-row.custom-submit-row a.custom-nav-btn {
+    background: #417690 !important;
+    border: 1px solid #417690 !important;
+    color: #fff !important;
+    padding: 8px 12px !important;
+    border-radius: 4px !important;
+    font-size: 13px !important;
+    line-height: 1.42857143 !important;
+    text-decoration: none !important;
+    display: inline-block !important;
+    height: auto !important;
+    vertical-align: middle !important;
+}
+
+.submit-row.custom-submit-row p.deletelink-box {
+    margin: 0 !important;
+    padding: 0 !important;
+    display: flex !important;
+    align-items: center !important;
+}

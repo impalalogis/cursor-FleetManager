@@ -1,0 +1,35 @@
+{% extends "admin/change_list.html" %}
+{% load static %}
+
+{% block content_title %}
+<div style="margin-bottom:15px;">
+    <div style="display:flex; gap:15px; align-items:center;">
+
+        <!-- Consignor Filter -->
+        <form method="get" style="display:inline-block;">
+            <select name="consignor" onchange="this.form.submit()" class="admin-filter-select">
+                <option value="">Filter by Consignor</option>
+                {% for c in consignors %}
+                    <option value="{{ c.id }}" {% if request.GET.consignor == c.id|stringformat:"s" %}selected{% endif %}>
+                        {{ c.organization_name }}
+                    </option>
+                {% endfor %}
+            </select>
+        </form>
+
+        <!-- Consignee Filter -->
+        <form method="get" style="display:inline-block;">
+            <select name="consignee" onchange="this.form.submit()" class="admin-filter-select">
+                <option value="">Filter by Consignee</option>
+                {% for c in consignees %}
+                    <option value="{{ c.id }}" {% if request.GET.consignee == c.id|stringformat:"s" %}selected{% endif %}>
+                        {{ c.organization_name }}
+                    </option>
+                {% endfor %}
+            </select>
+        </form>
+
+    </div>
+</div>
+{{ block.super }}
+{% endblock %}

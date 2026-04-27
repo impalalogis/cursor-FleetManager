@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Lorry Receipt (LR)  {{ shipment.planned_departure|default:"-" }}</title>
+    <style>
+        @page {
+            size: A4 landscape;
+            margin: 12mm;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            font-size: 10px;
+            color: #000;
+            margin: 0;
+            padding: 0;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            border: 1px solid #000;
+            padding: 3px;
+            vertical-align: top;
+        }
+
+        th {
+            font-size: 8px;
+            font-weight: bold;
+            text-align: center;
+        }
+
+        td {
+            font-size: 8px;
+            line-height: 1.2;
+        }
+
+        .small {
+            font-size: 7px;
+            line-height: 1.2;
+        }
+
+        .text-center {
+            text-align: center;
+        }
+
+        .text-right {
+            text-align: right;
+        }
+
+        .company-header {
+            text-align: center;
+            margin-bottom: 10px;
+        }
+
+        .company-name {
+            font-size: 22px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .company-text {
+            font-size: 10px;
+            line-height: 1.3;
+        }
+
+        .doc-title {
+            text-align: center;
+            font-size: 13px;
+            font-weight: bold;
+            margin: 8px 0 10px 0;
+        }
+
+        .spacer {
+            height: 6px;
+        }
+
+        .summary-table {
+            margin-top: 10px;
+        }
+
+        .signature-wrapper {
+            margin-top: 50px;
+            text-align: right;
+        }
+
+        .signature-label {
+            font-weight: bold;
+            margin-top: 4px;
+        }
+
+        .footer {
+            margin-top: 15px;
+            text-align: center;
+            font-size: 10px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- HEADER -->
+    <div class="company-header" style="text-align:center; margin-bottom:5px;">
+        <div class="company-name" style="font-size:22px; font-weight:bold; text-transform:uppercase; margin:0; padding:0; line-height:1.1;">
+            Impala Logistics
+        </div>
+
+        <div class="company-text" style="font-size:10px; margin:0; padding:0; line-height:1.1;">
+            2nd Floor City Tower, Opp. Genexx Exotica, Kumarpur, Asansol-713304, West Bengal
+        </div>
+
+        <div class="company-text" style="font-size:10px; margin:0; padding:0; line-height:1.1;">
+            GSTIN - 19BJQPS7761G1ZC
+        </div>
+    </div>
+
+    <div class="doc-title">Lorry Receipt (LR) </div>
+
+    <table>
+        <tr>
+            <td width="50%"><strong>Shipment No:</strong> {{ shipment.shipment_id|default:"-" }}</td>
+{#            <td width="33%"><strong>Group No:</strong>#}
+{#                {% if shipment.consignment_group %}#}
+{#                    {{ shipment.consignment_group.group_id|default:"-" }}#}
+{#                {% else %}#}
+{#                    -#}
+{#                {% endif %}#}
+{#            </td>#}
+            <td width="50%"><strong>Date:</strong>
+                {% if shipment.actual_departure %}
+                    {{ shipment.actual_departure|date:"d-m-Y" }}
+                {% elif shipment.planned_departure %}
+                    {{ shipment.planned_departure|date:"d-m-Y" }}
+                {% else %}
+                    -
+                {% endif %}
+            </td>
+        </tr>
+    </table>
+
+    <div class="spacer"></div>
+
+    <table>
+        <tr>
+            <td width="50%"><strong>Driver:</strong>
+                {% if shipment.driver %}
+                    {{ shipment.driver.first_name|default:"" }} {{ shipment.driver.last_name|default:"" }}
+                {% else %}
+                    -
+                {% endif %}
+            </td>
+            <td width="50%"><strong>Vehicle No:</strong>
+                {% if shipment.vehicle %}
+                    {{ shipment.vehicle.registration_number|default:"-" }}
+                {% else %}
+                    -
+                {% endif %}
+            </td>
+        </tr>
+    </table>
+
+    <div class="spacer"></div>
+
+    <table>
+        <tr>
+
+            <td width="34%"><strong>Invoice No:</strong> {{ shipment.invoice_no|default:"-" }}</td>
+            <td width="33%"><strong>E-Way Bill:</strong> {{ shipment.e_way_bill|default:"-" }}</td>
+            <td width="33%"><strong>LR No:</strong> {{ shipment.lr_no|default:"-" }}</td>
+        </tr>
+    </table>
+
+    <div class="spacer"></div>
+
+    <table>
+        <thead>
+            <tr>
+                <th width="4%">Sl</th>
+{#                <th width="12%">Consignment</th>#}
+                <th width="18%">Consignor</th>
+                <th width="16%">Consignee</th>
+                <th width="13%">From</th>
+                <th width="13%">To</th>
+                <th width="10%">Item</th>
+                <th width="6%">Pkg</th>
+                <th width="6%">Wt</th>
+                <th width="6%">Rate</th>
+                <th width="8%">Freight</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for c in consignments %}
+            <tr>
+                <td class="text-center">{{ forloop.counter }}</td>
+
+
+                <td class="small">
+                    {% if c.consignor %}
+                        <strong>{{ c.consignor.organization_name|default:"-" }}</strong><br>
+                        {{ c.consignor.address_line_1|default:"" }}
+                        {% if c.consignor.address_line_2 %}<br>{{ c.consignor.address_line_2 }}{% endif %}
+                        {% if c.consignor.city %}<br>{{ c.consignor.city }}{% endif %}
+                        {% if c.consignor.state %}, {{ c.consignor.state }}{% endif %}
+                        {% if c.consignor.pincode %} - {{ c.consignor.pincode }}{% endif %}
+                    {% else %}
+                        -
+                    {% endif %}
+                </td>
+
+                <td class="small">
+                    {% if c.consignee %}
+                        <strong>{{ c.consignee.organization_name|default:"-" }}</strong><br>
+                        {{ c.consignee.address_line_1|default:"" }}
+                        {% if c.consignee.address_line_2 %}<br>{{ c.consignee.address_line_2 }}{% endif %}
+                        {% if c.consignee.city %}<br>{{ c.consignee.city }}{% endif %}
+                        {% if c.consignee.state %}, {{ c.consignee.state }}{% endif %}
+                        {% if c.consignee.pincode %} - {{ c.consignee.pincode }}{% endif %}
+                    {% else %}
+                        -
+                    {% endif %}
+                </td>
+
+                <td>
+                    {% if c.from_location %}
+                        {{ c.from_location.name|default:"-" }}
+                    {% else %}
+                        -
+                    {% endif %}
+                </td>
+
+                <td>
+                    {% if c.to_location %}
+                        {{ c.to_location.name|default:"-" }}
+                    {% else %}
+                        -
+                    {% endif %}
+                </td>
+
+                <td>
+                    {% if c.material_type %}
+                        {{ c.material_type.name|default:c.material_type }}
+                    {% else %}
+                        -
+                    {% endif %}
+                </td>
+
+                <td class="text-center">{{ c.number_of_packages|default:"-" }}</td>
+                <td class="text-center">
+                {% if c.weight %}
+                        {{ c.weight }}{% if c.weight_unit %} {{ c.weight_unit.name|default:c.weight_unit }}{% endif %}
+                {% else %}
+        -
+    {% endif %}
+                </td>
+
+                <td class="text-center">
+                    {% if c.rate %}
+                        {{ c.rate }}
+                    {% else %}
+                        -
+                    {% endif %}
+                </td>
+
+                <td class="text-center">
+                    {% if c.rate and c.total_freight %}
+                        {{ c.total_freight }}
+                    {% else %}
+                        To Be billed
+                    {% endif %}
+                </td>
+            </tr>
+            {% empty %}
+            <tr>
+                <td colspan="11" class="text-center">No consignments found for this shipment.</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <div class="spacer"></div>
+
+    <table class="summary-table">
+        <tr>
+            <td width="70%"><strong>Total Amount</strong></td>
+            <td width="30%" class="text-right">{{ total_amount|default:"0.00" }}</td>
+        </tr>
+        <tr>
+            <td><strong>Advance</strong></td>
+            <td class="text-right">{{ advance|default:"0.00" }}</td>
+        </tr>
+        <tr>
+            <td><strong>To Pay</strong></td>
+            <td class="text-right">{{ to_pay|default:"0.00" }}</td>
+        </tr>
+    </table>
+
+     <!-- PAY TO + SIGNATURE SIDE BY SIDE -->
+    <div style="width:100%; margin-top:20px;">
+
+        <!-- LEFT SIDE: PAY TO -->
+        <div style="width:55%; float:left; font-size:9px; line-height:1.3; vertical-align:top;">
+            <strong>Pay To:</strong><br>
+            <strong>Account No.:</strong> 192605000599<br>
+            <strong>IFSC:</strong> ICIC0001926<br>
+            <strong>PAN:</strong> BJQPS7761G<br>
+        </div>
+
+        <!-- RIGHT SIDE: SIGNATURE -->
+        <div style="width:40%; float:right; text-align:right; vertical-align:top;">
+            {% if signature_uri %}
+                <img src="{{ signature_uri }}" width="100" height="38" alt="Authorized Signature" style="margin:0; padding:0;">
+            {% endif %}
+            <div style="font-weight:bold; margin-top:2px;">Authorized Signature</div>
+        </div>
+
+        <div style="clear:both;"></div>
+    </div>
+
+    <div class="footer">
+        **All Disputes subjects to Asansol Jurisdiction
+    </div>
+
+</body>
+</html>

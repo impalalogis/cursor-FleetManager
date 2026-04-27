@@ -1,0 +1,28 @@
+ORG
+Broker -> dependent org
+Transporter -> dependent org,
+Owner -> dependent org
+Driver -> dependent Owner
+Vhichele -> dependent Owner
+
+
+Operation
+Consignment -> dependent ORG, Broker, Transporter
+Consignment groups -> dependent Consignment
+Shipment -> dependent Consignment groups, Driver, Vhichle
+Shipment expense -> dependent Shipment
+Shipment Status -> dependent Shipment
+Driver Advance -> dependent Shipment
+
+
+
+Finance
+Other expense -> No dependency
+Invoice -> Consigment group, Shipment
+payment -> invoice
+
+
+Maintenance
+Maintenance records	-> No dependency
+Tyre-> No dependency
+Tyre transactions -> Tyre

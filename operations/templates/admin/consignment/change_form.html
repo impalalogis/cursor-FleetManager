@@ -1,0 +1,45 @@
+{% extends "admin/change_form.html" %}
+
+{% block submit_buttons_top %}
+{% with btns=block.super %}
+<div class="submit-row custom-submit-row">
+
+    {{ btns|safe|cut:"<div class=\"submit-row\">"|cut:"</div>" }}
+
+    {% if back_step_url %}
+        <a href="{{ back_step_url }}" class="custom-nav-btn" style="background:#6c757d !important;">
+            {{ back_step_label }}
+        </a>
+    {% endif %}
+
+    {% if next_step_url %}
+        <a href="{{ next_step_url }}" class="custom-nav-btn">
+            {{ next_step_label }}
+        </a>
+    {% endif %}
+
+</div>
+{% endwith %}
+{% endblock %}
+
+{% block submit_buttons_bottom %}
+{% with btns=block.super %}
+<div class="submit-row custom-submit-row">
+
+    {{ btns|safe|cut:"<div class=\"submit-row\">"|cut:"</div>" }}
+
+    {% if back_step_url %}
+        <a href="{{ back_step_url }}" class="custom-nav-btn" style="background:#6c757d !important;">
+            {{ back_step_label }}
+        </a>
+    {% endif %}
+
+    {% if next_step_url %}
+        <a href="{{ next_step_url }}" class="custom-nav-btn">
+            {{ next_step_label }}
+        </a>
+    {% endif %}
+
+</div>
+{% endwith %}
+{% endblock %}
