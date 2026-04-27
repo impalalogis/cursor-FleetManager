@@ -51,7 +51,13 @@ def create_transaction_from_model(sender, instance, transaction_type, category, 
     """
     try:
         # Determine the amount based on the source model
-        amount = getattr(instance, 'amount', None) or getattr(instance, 'cost', None) or 0
+        amount = (
+            getattr(instance, 'amount', None)
+            or getattr(instance, 'total_cost', None)
+            or getattr(instance, 'cost', None)
+            or getattr(instance, 'amount_paid', None)
+            or 0
+        )
         
         if amount <= 0:
             return  # Skip if no valid amount
@@ -124,6 +130,14 @@ def create_transaction_from_model(sender, instance, transaction_type, category, 
             transaction_data[source_field] = instance
         
         # Check if transaction already exists for this source
+        if not source_field:
+            logger.warning(
+                "No source field mapping for sender=%s instance=%s",
+                sender.__name__,
+                instance.pk,
+            )
+            return
+
         existing_transaction = Transaction.objects.filter(**{source_field: instance}).first()
         
         if existing_transaction:
@@ -139,15 +153,20 @@ def create_transaction_from_model(sender, instance, transaction_type, category, 
                 tx.save()
     except Exception as e:
         # Log the error but don't break the original save
-        print("error: ", str(e))
-        print(f"Error creating transaction from {sender.__name__}: {e}")
+        logger.error(
+            "Error creating transaction from %s (id=%s): %s",
+            sender.__name__,
+            getattr(instance, "pk", None),
+            e,
+            exc_info=True,
+        )
 
 
 @receiver(post_save, sender='operations.ShipmentExpense')
 def create_transaction_from_shipment_expense(sender, instance, created, **kwargs):
     """Create transaction from ShipmentExpense"""
     if not hasattr(instance, 'amount') or not instance.amount:
-        print("Not found amount attribute in instance of shipment expense")
+        logger.debug("Skipping ShipmentExpense %s: amount missing/zero", instance.pk)
         return
         
     create_transaction_from_model(
@@ -177,34 +196,17 @@ def create_transaction_from_driver_advance(sender, instance, created, **kwargs):
 @receiver(post_save, sender='maintenance.MaintenanceRecord')
 def create_transaction_from_maintenance(sender, instance, created, **kwargs):
     """Create transaction from MaintenanceRecord"""
-    if not hasattr(instance, 'total_cost') or not instance.total_cost:
-        return
-
-    create_transaction_from_model(
-        sender=sender,
-        instance=instance,
-        transaction_type='expense',
-        category='maintenance',
-        **kwargs
-    )
+    # Ownership for MaintenanceRecord -> Transaction is handled in maintenance.signals.
+    # Keep this receiver as a no-op to avoid duplicate update/write paths.
+    return
 
 
 @receiver(post_save, sender='maintenance.Tyre')
 def create_transaction_from_tyre_purchase(sender, instance, created, **kwargs):
     """Create transaction from Tyre purchase"""
-    if not created:  # Only for new tyre purchases
-        return
-        
-    if not hasattr(instance, 'amount') or not instance.amount:
-        return
-        
-    create_transaction_from_model(
-        sender=sender,
-        instance=instance,
-        transaction_type='expense',
-        category='tyre',
-        **kwargs
-    )
+    # Ownership for Tyre purchase -> Transaction is handled in maintenance.signals.
+    # Keep this receiver as a no-op to avoid duplicate update/write paths.
+    return
 
 
 @receiver(post_save, sender='maintenance.TyreTransaction')
@@ -242,7 +244,11 @@ def create_transaction_from_other_expense(sender, instance, created, **kwargs):
 
     expense_category = 'office'  # default
     if hasattr(instance, 'category') and instance.category:
-        category_value = getattr(instance.category, 'value', str(instance.category))
+        category_value = (
+            getattr(instance.category, 'internal_value', None)
+            or getattr(instance.category, 'value', None)
+            or str(instance.category)
+        )
         expense_category = category_mapping.get(category_value, 'office')
 
     create_transaction_from_model(
@@ -297,7 +303,12 @@ def create_transaction_from_payment(sender, instance, created, **kwargs):
             safe_calculate_invoice_totals(instance.invoice)
             
     except Exception as e:
-        print(f"Error creating transaction from Payment: {e}")
+        logger.error(
+            "Error creating transaction from Payment (id=%s): %s",
+            getattr(instance, "pk", None),
+            e,
+            exc_info=True,
+        )
 
 
 @receiver(post_delete, sender=Payment)
@@ -313,8 +324,6 @@ def update_invoice_on_payment_delete(sender, instance, **kwargs):
 
 @receiver(post_delete, sender='operations.ShipmentExpense')
 @receiver(post_delete, sender='operations.DriverAdvance')
-@receiver(post_delete, sender='maintenance.MaintenanceRecord')
-@receiver(post_delete, sender='maintenance.Tyre')
 @receiver(post_delete, sender='maintenance.TyreTransaction')
 @receiver(post_delete, sender=OfficeExpense)
 def delete_related_transaction(sender, instance, **kwargs):
@@ -335,7 +344,13 @@ def delete_related_transaction(sender, instance, **kwargs):
             Transaction.objects.filter(**{source_field: instance}).delete()
             
     except Exception as e:
-        print(f"Error deleting related transaction: {e}")
+        logger.error(
+            "Error deleting related transaction for %s (id=%s): %s",
+            sender.__name__,
+            getattr(instance, "pk", None),
+            e,
+            exc_info=True,
+        )
 
 
 # Helper function to manually sync existing data
