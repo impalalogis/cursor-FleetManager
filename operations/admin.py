@@ -1931,7 +1931,6 @@ class DriverAdvanceAdmin(admin.ModelAdmin):
     def _build_driver_ledger(self, driver):
         from operations.models import ShipmentExpense
         from django.contrib.contenttypes.models import ContentType
-        from financial.models import Transaction
         from decimal import Decimal
 
         driver_ct = ContentType.objects.get_for_model(driver)
@@ -1973,30 +1972,6 @@ class DriverAdvanceAdmin(admin.ModelAdmin):
                 "debit": Decimal(e["amount"] or 0),
                 "credit": Decimal("0"),
                 "description": e["description"] or "",
-            })
-
-        # ---------------------------------------------------------
-        # 3) TRANSACTIONS (MAINTENANCE, TYRE, OFFICE, ETC.)
-        # ---------------------------------------------------------
-        txs = Transaction.objects.filter(driver=driver).values(
-            "transaction_date",
-            "transaction_type",
-            "category",
-            "amount",
-            "description",
-            "shipment__shipment_id"
-        )
-
-        for t in txs:
-            is_debit = t["transaction_type"] == "expense"
-
-            ledger.append({
-                "date": t["transaction_date"],
-                "type": t["category"].capitalize(),
-                "shipment": t["shipment__shipment_id"],
-                "debit": Decimal(t["amount"] or 0) if is_debit else Decimal("0"),
-                "credit": Decimal(t["amount"] or 0) if not is_debit else Decimal("0"),
-                "description": t["description"] or "",
             })
 
         # ---------------------------------------------------------

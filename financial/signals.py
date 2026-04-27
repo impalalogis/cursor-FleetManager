@@ -177,9 +177,9 @@ def create_transaction_from_driver_advance(sender, instance, created, **kwargs):
 @receiver(post_save, sender='maintenance.MaintenanceRecord')
 def create_transaction_from_maintenance(sender, instance, created, **kwargs):
     """Create transaction from MaintenanceRecord"""
-    if not hasattr(instance, 'cost') or not instance.cost:
+    if not hasattr(instance, 'total_cost') or not instance.total_cost:
         return
-        
+
     create_transaction_from_model(
         sender=sender,
         instance=instance,
@@ -236,15 +236,15 @@ def create_transaction_from_other_expense(sender, instance, created, **kwargs):
         'INSURANCE': 'insurance',
         'PERMIT': 'permit',
         'TOLL': 'toll',
-        'OfficeExpenses':'OfficeExpenses',
-        'rent':'OfficeExpenses'
+        'OfficeExpenses': 'office',
+        'rent': 'office'
     }
-    
-    expense_category = 'OfficeExpenses'  # default
+
+    expense_category = 'office'  # default
     if hasattr(instance, 'category') and instance.category:
         category_value = getattr(instance.category, 'value', str(instance.category))
-        expense_category = category_mapping.get(category_value, 'OfficeExpenses')
-    
+        expense_category = category_mapping.get(category_value, 'office')
+
     create_transaction_from_model(
         sender=sender,
         instance=instance,

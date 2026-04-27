@@ -757,8 +757,7 @@ class InvoiceAdmin(NavigationButtonMixin, admin.ModelAdmin):
             payments = float(payments)
 
             # 5. FINAL FORMULA: (freight + detention) - advances - payments
-            total_dues = (freight + detention) -( total_advances + payments)
-            print(total_dues)
+            total_dues = (freight + detention) - (total_advances + payments)
 
             # 6. Color coding
             color = "green" if total_dues <= 0 else "red"
@@ -883,7 +882,7 @@ class InvoiceAdmin(NavigationButtonMixin, admin.ModelAdmin):
 
                 # Calculate totals: (freight + detention) - (advances + payments)
                 total_deductions = invoice.total_advance + invoice.payment_received
-                invoice.total_dues = (invoice.total_freight + invoice.detention) - total_deductions
+                invoice.total_dues = (invoice.total_freight + invoice.detention_amount) - total_deductions
 
                 # Balance (freight - expenses) – detention does NOT affect this
                 invoice.balance_amount = invoice.total_freight - invoice.total_expense
