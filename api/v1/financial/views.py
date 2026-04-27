@@ -1,307 +1,581 @@
 """
-Financial Views for Fleet Manager API
-Comprehensive viewsets matching admin panel functionality
+Financial API views.
 """
 
-from rest_framework import viewsets, permissions, filters, status
-from rest_framework.decorators import action
+import base64
+from datetime import date
+from io import BytesIO
+from pathlib import Path
+
+from django.conf import settings
+from django.db.models import Q, Sum
+from django.http import HttpResponse
+from django.shortcuts import get_object_or_404
+from django.template.loader import render_to_string
+from rest_framework import status
 from rest_framework.response import Response
-from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import extend_schema, OpenApiParameter
-from django.db.models import Q, Sum, Count
-from datetime import date, timedelta
+from rest_framework.views import APIView
+from xhtml2pdf import pisa
 
-from financial.models import (
-    Invoice, Payment, Transaction, OfficeExpense, BankTransfer
-)
-from api.utils import IsOwnerOrReadOnly, success_response, error_response
+from financial.models import BankTransfer, Invoice, OfficeExpense, Payment, Transaction
+from financial.signals import safe_calculate_invoice_totals
+
 from .serializers import (
-    InvoiceSerializer, InvoiceListSerializer, PaymentSerializer,
-    TransactionSerializer, OtherExpenseSerializer, BankTransferSerializer
+    BankTransferSerializer,
+    InvoiceSerializer,
+    OtherExpenseSerializer,
+    PaymentSerializer,
+    TransactionSerializer,
 )
 
 
-class InvoiceViewSet(viewsets.ModelViewSet):
-    """ViewSet for Invoice model"""
-    queryset = Invoice.objects.select_related('shipment', 'consignmentGroup').prefetch_related('payments').all()
-    permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = [
-        'shipment', 'consignmentGroup', 'status', 'issue_date',
-        'due_date', 'is_paid'
-    ]
-    search_fields = [
-        'invoice_id', 'shipment__shipment_id', 'consignmentGroup__group_id'
-    ]
-    ordering_fields = ['invoice_id', 'issue_date', 'due_date', 'total_dues']
-    ordering = ['-issue_date']
-    
-    def get_serializer_class(self):
-        if self.action == 'list':
-            return InvoiceListSerializer
-        return InvoiceSerializer
-    
-    @action(detail=False, methods=['get'])
-    def overdue(self, request):
-        """Get overdue invoices"""
-        today = date.today()
-        invoices = self.queryset.filter(
-            due_date__lt=today,
-            payment_status__in=['UNPAID', 'PARTIAL']
+class InvoiceListCreate(APIView):
+    def get(self, request):
+        queryset = Invoice.objects.select_related("shipment", "consignmentGroup").prefetch_related("payments").order_by(
+            "-issue_date",
+            "-id",
         )
-        serializer = self.get_serializer(invoices, many=True)
-        return Response(success_response(serializer.data))
-    
-    @action(detail=False, methods=['get'])
-    def unpaid(self, request):
-        """Get unpaid invoices"""
-        invoices = self.queryset.filter(payment_status='UNPAID')
-        serializer = self.get_serializer(invoices, many=True)
-        return Response(success_response(serializer.data))
-    
-    @action(detail=False, methods=['get'])
-    def partially_paid(self, request):
-        """Get partially paid invoices"""
-        invoices = self.queryset.filter(payment_status='PARTIAL')
-        serializer = self.get_serializer(invoices, many=True)
-        return Response(success_response(serializer.data))
-    
-    @action(detail=True, methods=['get'])
-    def payment_history(self, request, pk=None):
-        """Get payment history for invoice"""
-        invoice = self.get_object()
-        payments = invoice.payments.all().order_by('-payment_date')
-        serializer = PaymentSerializer(payments, many=True)
-        return Response(success_response(serializer.data))
-    
-    @action(detail=True, methods=['post'])
-    def calculate_totals(self, request, pk=None):
-        """Recalculate invoice totals"""
-        invoice = self.get_object()
-        
-        # This would typically call a method on the model
-        # invoice.calculate_totals()
-        invoice.save()
-        
-        serializer = self.get_serializer(invoice)
-        return Response(success_response(serializer.data))
-    
-    @action(detail=False, methods=['get'])
-    def summary(self, request):
-        """Get invoice summary statistics"""
-        queryset = self.get_queryset()
-        
+        shipment_id = request.GET.get("shipment")
+        if shipment_id:
+            queryset = queryset.filter(shipment_id=shipment_id)
+        status_param = request.GET.get("status")
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+        is_paid = request.GET.get("is_paid")
+        if is_paid in {"true", "false", "1", "0"}:
+            queryset = queryset.filter(is_paid=is_paid in {"true", "1"})
+
+        serializer = InvoiceSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        serializer = InvoiceSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            InvoiceSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class InvoiceDetail(APIView):
+    def get_object(self, pk: int):
+        return Invoice.objects.select_related("shipment", "consignmentGroup").prefetch_related("payments").filter(
+            pk=pk
+        ).first()
+
+    def get(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            InvoiceSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def post(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = InvoiceSerializer(
+            instance,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            InvoiceSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def delete(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        instance.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class InvoiceCalculateTotals(APIView):
+    def post(self, request, pk: int):
+        invoice = get_object_or_404(Invoice, pk=pk)
+        invoice.calculate_totals()
+        return Response(
+            InvoiceSerializer(invoice, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class InvoiceMarkStatus(APIView):
+    """
+    Set invoice status quickly.
+    Payload:
+      {"status": "PAID" | "PENDING"}
+    """
+
+    def post(self, request, pk: int):
+        invoice = get_object_or_404(Invoice, pk=pk)
+        status_value = (request.data.get("status") or "").upper().strip()
+        if status_value not in {"PAID", "PENDING"}:
+            return Response(
+                {"status": "Allowed values are PAID or PENDING."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        invoice.status = status_value
+        invoice.is_paid = status_value == "PAID"
+        invoice.save(skip_calculation=True)
+        return Response(
+            InvoiceSerializer(invoice, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class InvoicePaymentHistory(APIView):
+    def get(self, request, pk: int):
+        invoice = get_object_or_404(Invoice, pk=pk)
+        payments = invoice.payments.order_by("-payment_date", "-id")
+        serializer = PaymentSerializer(payments, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class InvoiceSummary(APIView):
+    def get(self, request):
+        queryset = Invoice.objects.all()
         summary = {
-            'total_invoices': queryset.count(),
-            'total_amount': float(queryset.aggregate(Sum('total_amount'))['total_amount__sum'] or 0),
-            'unpaid_count': queryset.filter(payment_status='UNPAID').count(),
-            'unpaid_amount': float(queryset.filter(payment_status='UNPAID').aggregate(Sum('total_amount'))['total_amount__sum'] or 0),
-            'overdue_count': queryset.filter(due_date__lt=date.today(), payment_status__in=['UNPAID', 'PARTIAL']).count(),
-            'paid_count': queryset.filter(payment_status='PAID').count(),
+            "total_invoices": queryset.count(),
+            "total_dues_sum": float(queryset.aggregate(total=Sum("total_dues"))["total"] or 0),
+            "paid_count": queryset.filter(is_paid=True).count(),
+            "pending_count": queryset.filter(is_paid=False).count(),
+            "overdue_count": queryset.filter(due_date__lt=date.today(), is_paid=False).count(),
         }
-        
-        return Response(success_response(summary))
+        return Response(summary, status=status.HTTP_200_OK)
 
 
-class PaymentViewSet(viewsets.ModelViewSet):
-    """ViewSet for Payment model"""
-    queryset = Payment.objects.select_related(
-        'invoice', 'method', 'from_banking_detail', 'to_banking_detail'
-    ).all()
-    serializer_class = PaymentSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = [
-        'invoice', 'method', 'status', 'payment_date', 'cheque_status',
-        'from_banking_detail', 'to_banking_detail'
-    ]
-    search_fields = [
-        'reference_number', 'transaction_reference', 'utr_number',
-        'transaction_id', 'cheque_number', 'invoice__invoice_number'
-    ]
-    ordering_fields = ['payment_date', 'amount_paid']
-    ordering = ['-payment_date']
-    
-    @action(detail=False, methods=['get'])
-    def pending(self, request):
-        """Get pending payments"""
-        payments = self.queryset.filter(status='PENDING')
-        serializer = self.get_serializer(payments, many=True)
-        return Response(success_response(serializer.data))
-    
-    @action(detail=False, methods=['get'])
-    def completed(self, request):
-        """Get completed payments"""
-        payments = self.queryset.filter(status='COMPLETED')
-        serializer = self.get_serializer(payments, many=True)
-        return Response(success_response(serializer.data))
-    
-    @action(detail=False, methods=['get'])
-    def by_method(self, request):
-        """Get payments by method"""
-        method = request.query_params.get('method')
-        if not method:
-            return Response(error_response('Method parameter is required'), status=400)
-        
-        payments = self.queryset.filter(method_id=method)
-        serializer = self.get_serializer(payments, many=True)
-        return Response(success_response(serializer.data))
-    
-    @action(detail=True, methods=['post'])
-    def mark_completed(self, request, pk=None):
-        """Mark payment as completed"""
-        payment = self.get_object()
-        payment.status = 'COMPLETED'
-        payment.save()
-        
-        # Update invoice payment status if needed
-        invoice = payment.invoice
+class InvoiceOverdueList(APIView):
+    def get(self, request):
+        queryset = Invoice.objects.filter(due_date__lt=date.today(), is_paid=False).order_by("due_date")
+        serializer = InvoiceSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class InvoiceUnpaidList(APIView):
+    def get(self, request):
+        queryset = Invoice.objects.filter(is_paid=False).order_by("-issue_date", "-id")
+        serializer = InvoiceSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class InvoicePartiallyPaidList(APIView):
+    def get(self, request):
+        queryset = Invoice.objects.filter(
+            is_paid=False,
+            payment_received__gt=0,
+        ).order_by("-issue_date", "-id")
+        serializer = InvoiceSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class InvoicePdfView(APIView):
+    """
+    API equivalent of admin invoice PDF render.
+    """
+
+    def get(self, request, pk: int):
+        invoice = get_object_or_404(
+            Invoice.objects.select_related(
+                "shipment",
+                "shipment__driver",
+                "shipment__vehicle",
+                "shipment__consignment_group",
+            ).prefetch_related(
+                "shipment__consignment_group__consignments",
+                "payments",
+            ),
+            pk=pk,
+        )
+
+        consignments = (
+            invoice.shipment.consignment_group.consignments.all()
+            if invoice.shipment and invoice.shipment.consignment_group
+            else []
+        )
+
+        signature_uri = None
+        signature_path = Path(settings.BASE_DIR) / "operations" / "static" / "images" / "authorized_signature.png"
+        if signature_path.exists():
+            with open(signature_path, "rb") as image_file:
+                signature_uri = "data:image/png;base64," + base64.b64encode(image_file.read()).decode("utf-8")
+
+        bill_to_party = None
+        bill_to_address = None
+        bill_to_gst = None
+        party = None
+
+        if invoice.bill_to == "CONSIGNOR":
+            party = consignments[0].consignor if consignments else None
+        elif invoice.bill_to == "CONSIGNEE":
+            party = consignments[0].consignee if consignments else None
+        elif invoice.bill_to == "TRANSPORTER":
+            party = invoice.shipment.transporter if invoice.shipment else None
+        elif invoice.bill_to == "BROKER":
+            party = invoice.shipment.broker if invoice.shipment else None
+
+        if party:
+            bill_to_party = getattr(party, "organization_name", str(party))
+            bill_to_address = party.get_formatted_address() if hasattr(party, "get_formatted_address") else ""
+            bill_to_gst = getattr(party, "GST_NO", "")
+
+        html = render_to_string(
+            "admin/invoice/invoice_pdf.html",
+            {
+                "invoice": invoice,
+                "shipment": invoice.shipment,
+                "consignments": consignments,
+                "detention_amount": invoice.detention_amount,
+                "breakdown": invoice.get_itemized_breakdown(),
+                "signature_uri": signature_uri,
+                "bill_to_party": bill_to_party,
+                "bill_to_address": bill_to_address,
+                "bill_to_gst": bill_to_gst,
+            },
+        )
+
+        output = BytesIO()
+        pdf = pisa.pisaDocument(BytesIO(html.encode("utf-8")), output)
+        if pdf.err:
+            return Response({"detail": "Error generating PDF"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        response = HttpResponse(output.getvalue(), content_type="application/pdf")
+        response["Content-Disposition"] = f'inline; filename="invoice_{invoice.invoice_id}.pdf"'
+        return response
+
+
+class PaymentListCreate(APIView):
+    def get(self, request):
+        queryset = Payment.objects.select_related(
+            "invoice",
+            "method",
+            "from_banking_detail",
+            "to_banking_detail",
+        ).order_by("-payment_date", "-id")
+        invoice_id = request.GET.get("invoice")
+        if invoice_id:
+            queryset = queryset.filter(invoice_id=invoice_id)
+        status_param = request.GET.get("status")
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+        serializer = PaymentSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        serializer = PaymentSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        if instance.invoice_id:
+            safe_calculate_invoice_totals(instance.invoice)
+        return Response(
+            PaymentSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class PaymentDetail(APIView):
+    def get_object(self, pk: int):
+        return Payment.objects.select_related("invoice", "method").filter(pk=pk).first()
+
+    def get(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            PaymentSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def post(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = PaymentSerializer(
+            instance,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        if instance.invoice_id:
+            safe_calculate_invoice_totals(instance.invoice)
+        return Response(
+            PaymentSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def delete(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        invoice = instance.invoice
+        instance.delete()
         if invoice:
-            total_paid = invoice.payments.filter(status='COMPLETED').aggregate(
-                Sum('amount_paid')
-            )['amount_paid__sum'] or 0
-            
-            if total_paid >= invoice.total_amount:
-                invoice.payment_status = 'PAID'
-            elif total_paid > 0:
-                invoice.payment_status = 'PARTIAL'
-            else:
-                invoice.payment_status = 'UNPAID'
-            
-            invoice.save()
-        
-        serializer = self.get_serializer(payment)
-        return Response(success_response(serializer.data))
-    
-    @action(detail=False, methods=['get'])
-    def summary(self, request):
-        """Get payment summary statistics"""
-        queryset = self.get_queryset()
-        
+            safe_calculate_invoice_totals(invoice)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class PaymentMarkCompleted(APIView):
+    def post(self, request, pk: int):
+        payment = get_object_or_404(Payment, pk=pk)
+        payment.status = "COMPLETED"
+        payment.save()
+        if payment.invoice_id:
+            safe_calculate_invoice_totals(payment.invoice)
+        return Response(
+            PaymentSerializer(payment, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class PaymentSummary(APIView):
+    def get(self, request):
+        queryset = Payment.objects.all()
         summary = {
-            'total_payments': queryset.count(),
-            'total_amount': float(queryset.aggregate(Sum('amount_paid'))['amount_paid__sum'] or 0),
-            'completed_count': queryset.filter(status='COMPLETED').count(),
-            'completed_amount': float(queryset.filter(status='COMPLETED').aggregate(Sum('amount_paid'))['amount_paid__sum'] or 0),
-            'pending_count': queryset.filter(status='PENDING').count(),
-            'pending_amount': float(queryset.filter(status='PENDING').aggregate(Sum('amount_paid'))['amount_paid__sum'] or 0),
+            "total_payments": queryset.count(),
+            "total_amount": float(queryset.aggregate(total=Sum("amount_paid"))["total"] or 0),
+            "completed_count": queryset.filter(status="COMPLETED").count(),
+            "pending_count": queryset.filter(status="PENDING").count(),
         }
-        
-        return Response(success_response(summary))
+        return Response(summary, status=status.HTTP_200_OK)
 
 
-class TransactionViewSet(viewsets.ModelViewSet):
-    """ViewSet for Transaction model"""
-    queryset = Transaction.objects.select_related('payment', 'payment__invoice').all()
-    serializer_class = TransactionSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = [
-        'payment', 'transaction_type', 'reconciled', 'transaction_date',
-        'reconciliation_date'
-    ]
-    search_fields = [
-        'reference_number', 'payment__invoice__invoice_number',
-        'payment__reference_number'
-    ]
-    ordering_fields = ['transaction_date', 'amount', 'reconciliation_date']
-    ordering = ['-transaction_date']
-    
-    @action(detail=False, methods=['get'])
-    def unreconciled(self, request):
-        """Get unreconciled transactions"""
-        transactions = self.queryset.filter(reconciled=False)
-        serializer = self.get_serializer(transactions, many=True)
-        return Response(success_response(serializer.data))
-    
-    @action(detail=True, methods=['post'])
-    def reconcile(self, request, pk=None):
-        """Mark transaction as reconciled"""
-        transaction = self.get_object()
-        transaction.reconciled = True
-        transaction.reconciliation_date = date.today()
-        transaction.save()
-        
-        serializer = self.get_serializer(transaction)
-        return Response(success_response(serializer.data))
+class PaymentPendingList(APIView):
+    def get(self, request):
+        queryset = Payment.objects.filter(status="PENDING").order_by("-payment_date", "-id")
+        serializer = PaymentSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-class OtherExpenseViewSet(viewsets.ModelViewSet):
-    """ViewSet for OfficeExpense model"""
-    queryset = OfficeExpense.objects.select_related('expense_type').all()
-    serializer_class = OtherExpenseSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['expense_type', 'expense_date']
-    search_fields = ['description', 'expense_type__display_name']
-    ordering_fields = ['expense_date', 'amount']
-    ordering = ['-expense_date']
-    
-    @action(detail=False, methods=['get'])
-    def by_type(self, request):
-        """Get expenses by type"""
-        expense_type = request.query_params.get('type')
-        if not expense_type:
-            return Response(error_response('Type parameter is required'), status=400)
-        
-        expenses = self.queryset.filter(expense_type_id=expense_type)
-        serializer = self.get_serializer(expenses, many=True)
-        return Response(success_response(serializer.data))
-    
-    @action(detail=False, methods=['get'])
-    def summary(self, request):
-        """Get expense summary by type"""
-        from django.db.models import Sum
-        from collections import defaultdict
-        
-        expenses = self.get_queryset()
-        summary = defaultdict(float)
-        
-        for expense in expenses.select_related('expense_type'):
-            type_name = expense.expense_type.display_name if expense.expense_type else 'Other'
-            summary[type_name] += float(expense.amount or 0)
-        
-        return Response(success_response(dict(summary)))
+class PaymentCompletedList(APIView):
+    def get(self, request):
+        queryset = Payment.objects.filter(status="COMPLETED").order_by("-payment_date", "-id")
+        serializer = PaymentSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-class BankTransferViewSet(viewsets.ModelViewSet):
-    """ViewSet for BankTransfer model"""
-    queryset = BankTransfer.objects.select_related(
-        'from_banking_detail', 'to_banking_detail'
-    ).all()
-    serializer_class = BankTransferSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = [
-        'from_banking_detail', 'to_banking_detail', 'status', 'transfer_date'
-    ]
-    search_fields = [
-        'reference_number', 'purpose', 'from_banking_detail__bank_name',
-        'to_banking_detail__bank_name'
-    ]
-    ordering_fields = ['transfer_date', 'amount']
-    ordering = ['-transfer_date']
-    
-    @action(detail=False, methods=['get'])
-    def pending(self, request):
-        """Get pending transfers"""
-        transfers = self.queryset.filter(status='PENDING')
-        serializer = self.get_serializer(transfers, many=True)
-        return Response(success_response(serializer.data))
-    
-    @action(detail=False, methods=['get'])
-    def completed(self, request):
-        """Get completed transfers"""
-        transfers = self.queryset.filter(status='COMPLETED')
-        serializer = self.get_serializer(transfers, many=True)
-        return Response(success_response(serializer.data))
-    
-    @action(detail=True, methods=['post'])
-    def mark_completed(self, request, pk=None):
-        """Mark transfer as completed"""
-        transfer = self.get_object()
-        transfer.status = 'COMPLETED'
+class PaymentByMethodList(APIView):
+    def get(self, request):
+        method = request.GET.get("method")
+        if not method:
+            return Response({"method": "This query param is required."}, status=status.HTTP_400_BAD_REQUEST)
+        queryset = Payment.objects.filter(Q(method_id=method) | Q(payment_method=method)).order_by(
+            "-payment_date",
+            "-id",
+        )
+        serializer = PaymentSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class TransactionListCreate(APIView):
+    def get(self, request):
+        queryset = Transaction.objects.select_related("shipment", "driver", "vehicle").order_by(
+            "-transaction_date",
+            "-created_at",
+        )
+        category = request.GET.get("category")
+        if category:
+            queryset = queryset.filter(category=category)
+        tx_type = request.GET.get("transaction_type")
+        if tx_type:
+            queryset = queryset.filter(transaction_type=tx_type)
+        serializer = TransactionSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        serializer = TransactionSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            TransactionSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class TransactionDetail(APIView):
+    def get_object(self, pk: int):
+        return Transaction.objects.select_related("shipment", "driver", "vehicle").filter(pk=pk).first()
+
+    def get(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            TransactionSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def post(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = TransactionSerializer(
+            instance,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            TransactionSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def delete(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        instance.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class OtherExpenseListCreate(APIView):
+    def get(self, request):
+        queryset = OfficeExpense.objects.select_related("category", "driver").order_by("-expense_date", "-id")
+        category = request.GET.get("category")
+        if category:
+            queryset = queryset.filter(category_id=category)
+        serializer = OtherExpenseSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        serializer = OtherExpenseSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            OtherExpenseSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class OtherExpenseDetail(APIView):
+    def get_object(self, pk: int):
+        return OfficeExpense.objects.select_related("category", "driver").filter(pk=pk).first()
+
+    def get(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            OtherExpenseSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def post(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = OtherExpenseSerializer(
+            instance,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            OtherExpenseSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def delete(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        instance.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class BankTransferListCreate(APIView):
+    def get(self, request):
+        queryset = BankTransfer.objects.select_related("from_banking_detail", "to_banking_detail").order_by(
+            "-initiated_datetime",
+            "-id",
+        )
+        status_param = request.GET.get("status")
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+        serializer = BankTransferSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        serializer = BankTransferSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            BankTransferSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class BankTransferDetail(APIView):
+    def get_object(self, pk: int):
+        return BankTransfer.objects.select_related("from_banking_detail", "to_banking_detail").filter(pk=pk).first()
+
+    def get(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            BankTransferSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def post(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = BankTransferSerializer(
+            instance,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            BankTransferSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def delete(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        instance.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class BankTransferMarkCompleted(APIView):
+    def post(self, request, pk: int):
+        transfer = get_object_or_404(BankTransfer, pk=pk)
+        transfer.status = "COMPLETED"
         transfer.save()
-        
-        serializer = self.get_serializer(transfer)
-        return Response(success_response(serializer.data))
+        return Response(
+            BankTransferSerializer(transfer, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class BankTransferPendingList(APIView):
+    def get(self, request):
+        queryset = BankTransfer.objects.filter(status="PENDING").order_by("-initiated_datetime", "-id")
+        serializer = BankTransferSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class BankTransferCompletedList(APIView):
+    def get(self, request):
+        queryset = BankTransfer.objects.filter(status="COMPLETED").order_by("-initiated_datetime", "-id")
+        serializer = BankTransferSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
