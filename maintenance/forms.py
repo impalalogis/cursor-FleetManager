@@ -1,8 +1,14 @@
+import logging
+
 from django import forms
 from django.contrib.contenttypes.models import ContentType
+from django.db import DatabaseError
+from django.db.utils import OperationalError, ProgrammingError
 
 from entity.models import Driver, Organization
 from maintenance.models import MaintenanceRecord
+
+logger = logging.getLogger(__name__)
 
 
 class DriverOwnerChoiceField(forms.ChoiceField):
@@ -22,8 +28,8 @@ class DriverOwnerChoiceField(forms.ChoiceField):
             owners = Organization.objects.filter(organization_type__internal_value='OWNER').order_by("organization_name")
             for owner in owners:
                 choices.append((f"owner_{owner.id}", f"Owner: {owner.organization_name}"))
-        except Exception:
-            pass
+        except (OperationalError, ProgrammingError, DatabaseError):
+            logger.exception("Failed to build Driver/Owner choices for MaintenanceRecord form")
         return choices
 
     def clean(self, value):
@@ -89,7 +95,8 @@ class MaintenanceRecordForm(forms.ModelForm):
             self.fields["performed_by_combined"].choices = (
                 self.fields["performed_by_combined"].get_choices()
             )
-        except Exception:
+        except (OperationalError, ProgrammingError, DatabaseError):
+            logger.exception("Failed to populate performed_by_combined choices")
             self.fields["performed_by_combined"].choices = [("", "---------")]
 
         # Pre-populate combined field when editing

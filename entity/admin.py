@@ -9,7 +9,6 @@ from entity.models import (
 )
 from operations.models import DriverAdvance, ShipmentExpense
 from maintenance.models import MaintenanceRecord, TyreTransaction
-from configuration.models import BankingDetail
 from django.utils.html import format_html
 
 class DriverAdvanceInline(admin.TabularInline):
@@ -32,7 +31,13 @@ class ShipmentExpenseInline(admin.TabularInline):
         # Get ContentType for Driver model
         from django.contrib.contenttypes.models import ContentType
         driver_ct = ContentType.objects.get_for_model(Driver)
-        return qs.filter(content_type=driver_ct)
+        qs = qs.filter(content_type=driver_ct)
+
+        # In Driver change view, scope inline rows to this specific driver.
+        object_id = getattr(getattr(request, "resolver_match", None), "kwargs", {}).get("object_id")
+        if object_id:
+            qs = qs.filter(object_id=object_id)
+        return qs
 
     def has_add_permission(self, request, obj=None):
         """Disable adding new expenses through this inline to avoid confusion"""
@@ -131,8 +136,7 @@ class DriverAdmin(admin.ModelAdmin):
 
     list_filter = ('gender', 'owner')
     readonly_fields = ('age', 'locality', 'district', 'state', 'country', 'city')
-    inlines = getattr(locals().get('DriverAdmin'), 'inlines', []) or []
-    inlines = inlines + [DriverDocumentInline]
+    inlines = [DriverDocumentInline]
 @admin.register(Organization)
 class OrganizationAdmin(admin.ModelAdmin):
     fieldsets = (

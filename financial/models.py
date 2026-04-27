@@ -305,7 +305,6 @@ class Invoice(models.Model):
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None
-        print("is_new ", self.pk)
         skip_calc = kwargs.pop('skip_calculation', False)
         super().save(*args, **kwargs)  # First save to get the PK if new
 
@@ -465,14 +464,12 @@ class Transaction(models.Model):
         # if self.amount < 0:
         #    raise ValidationError("Amount must be greater than or equal to 0")
         is_new = self.pk is None
-        print("is_new ", self.pk)
         super().save(*args, **kwargs)
 
         # Generate id for new invoices
         if is_new:
             today_str = timezone.now().strftime("%Y%m%d")
             self.transaction_id = f"TRN{today_str}{self.pk}"
-            print("is_new ", self.id)
             # Use update to avoid recursion or infinite loop
             Transaction.objects.filter(pk=self.pk).update(transaction_id=self.transaction_id)
 

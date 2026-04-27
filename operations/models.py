@@ -1049,7 +1049,6 @@ class DriverAdvance(models.Model):
 
         # cumulative expenses for THIS shipment & driver (unchanged)
         exp_cumulative = self._total_expenses_for_this_shipment_and_driver()
-        print("exp_cumulative ", exp_cumulative)
         # how much of these expenses were already applied by *earlier* advances on the same shipment?
         # prev_same = self._previous_advance_same_shipment()
 
