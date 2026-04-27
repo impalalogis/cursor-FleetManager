@@ -1,653 +1,934 @@
 """
-Operations Views for Fleet Manager API
-Comprehensive viewsets matching admin panel functionality
+Operations API views.
 """
 
-from rest_framework import viewsets, permissions, filters, status
-from rest_framework.decorators import action
+import base64
+from decimal import Decimal
+from io import BytesIO
+from pathlib import Path
+
+from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
+from django.db.models import Q, Sum
+from django.http import HttpResponse
+from django.shortcuts import get_object_or_404
+from django.template.loader import render_to_string
+from rest_framework import status
 from rest_framework.response import Response
-from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import extend_schema, OpenApiParameter
-from django.db.models import Q, Sum, Count
-from datetime import date, timedelta
 from rest_framework.views import APIView
+from xhtml2pdf import pisa
+
+import openpyxl
 
 from entity.models import Driver, Organization
 from operations.models import (
-    ConsignmentGroup, Consignment, Shipment, ShipmentExpense, 
-    DriverAdvance, ShipmentStatus
+    Consignment,
+    ConsignmentGroup,
+    Diesel,
+    DriverAdvance,
+    Shipment,
+    ShipmentExpense,
+    ShipmentStatus,
 )
+
 from .serializers import (
-    ConsignmentGroupSerializer, ConsignmentSerializer,
-    ShipmentSerializer, ShipmentListSerializer, ShipmentExpenseSerializer,
-    DriverAdvanceSerializer, ShipmentStatusSerializer
+    ConsignmentGroupSerializer,
+    ConsignmentSerializer,
+    DieselSerializer,
+    DriverAdvanceSerializer,
+    ShipmentExpenseSerializer,
+    ShipmentSerializer,
+    ShipmentStatusSerializer,
 )
+
+
+def _safe_decimal(value):
+    if value in (None, ""):
+        return Decimal("0")
+    return Decimal(str(value))
+
+
+def _apply_status_to_shipment(status_entry: ShipmentStatus):
+    """
+    Keep API behavior aligned with ShipmentStatusAdmin.save_model().
+    """
+    shipment = status_entry.shipment
+    if not shipment:
+        return
+
+    raw_status = ""
+    if status_entry.status:
+        raw_status = (
+            getattr(status_entry.status, "internal_value", None)
+            or getattr(status_entry.status, "name", None)
+            or ""
+        )
+    status_name = raw_status.replace(" ", "").replace("-", "").lower()
+
+    updates = []
+
+    # 1) Departure -> actual_departure + (optional) odometer_start from notes
+    if status_name in {"03_departure", "departure", "departed"}:
+        shipment.actual_departure = status_entry.effective_date
+        updates.append("actual_departure")
+        if status_entry.notes:
+            try:
+                shipment.odometer_start = Decimal(status_entry.notes.strip())
+                updates.append("odometer_start")
+            except Exception:
+                pass
+
+    # 2) Reached -> actual_arrival + (optional) odometer_start from notes (admin parity)
+    elif status_name in {"04_reached", "reached", "arrived"}:
+        shipment.actual_arrival = status_entry.effective_date
+        updates.append("actual_arrival")
+        if status_entry.notes:
+            try:
+                shipment.odometer_start = Decimal(status_entry.notes.strip())
+                updates.append("odometer_start")
+            except Exception:
+                pass
+
+    # 3) Completed -> (optional) odometer_end from notes
+    elif status_name in {"07_completed", "completed", "finished"}:
+        if status_entry.notes:
+            try:
+                shipment.odometer_end = Decimal(status_entry.notes.strip())
+                updates.append("odometer_end")
+            except Exception:
+                pass
+
+    # 4) auto-calc distance
+    if shipment.odometer_start is not None and shipment.odometer_end is not None:
+        shipment.total_distance = shipment.odometer_end - shipment.odometer_start
+        updates.append("total_distance")
+
+    if updates:
+        shipment.save(update_fields=list(set(updates)))
+
+
+def _build_driver_ledger(driver, from_date=None, to_date=None):
+    """
+    Mirror DriverAdvanceAdmin._build_driver_ledger.
+    """
+    driver_ct = ContentType.objects.get_for_model(driver)
+    rows = []
+
+    advances_qs = DriverAdvance.objects.filter(driver=driver)
+    if from_date:
+        advances_qs = advances_qs.filter(date__gte=from_date)
+    if to_date:
+        advances_qs = advances_qs.filter(date__lte=to_date)
+
+    for adv in advances_qs.values("date", "amount", "description", "shipment__shipment_id"):
+        rows.append(
+            {
+                "date": adv["date"],
+                "type": "Advance",
+                "shipment": adv["shipment__shipment_id"],
+                "debit": Decimal("0"),
+                "credit": _safe_decimal(adv["amount"]),
+                "description": adv["description"] or "",
+            }
+        )
+
+    expenses_qs = ShipmentExpense.objects.filter(content_type=driver_ct, object_id=driver.id)
+    if from_date:
+        expenses_qs = expenses_qs.filter(expense_date__gte=from_date)
+    if to_date:
+        expenses_qs = expenses_qs.filter(expense_date__lte=to_date)
+
+    for exp in expenses_qs.values(
+        "expense_date",
+        "amount",
+        "description",
+        "shipment__shipment_id",
+        "expense_type__display_value",
+    ):
+        rows.append(
+            {
+                "date": exp["expense_date"],
+                "type": exp["expense_type__display_value"] or "Shipment Expense",
+                "shipment": exp["shipment__shipment_id"],
+                "debit": _safe_decimal(exp["amount"]),
+                "credit": Decimal("0"),
+                "description": exp["description"] or "",
+            }
+        )
+
+    rows.sort(key=lambda item: (item["date"] or "", item["type"]))
+    running = Decimal("0")
+    for row in rows:
+        running += row["credit"]
+        running -= row["debit"]
+        row["running_balance"] = running
+
+    return {
+        "rows": rows,
+        "opening_balance": Decimal("0"),
+        "closing_balance": running,
+    }
 
 
 class ConsignmentListCreate(APIView):
-    """
-    GET  /api/v1/entity/consignments/      -> list (search/filter)
-    POST /api/v1/entity/consignments/      -> create
-    """
-
     def get(self, request):
-        qs = (
-            Consignment.objects
-            .select_related(
-                "consignor", "consignee",
-                "material_type", "weight_unit", "packaging_type",
-                "vehicle_type", "freight_mode", "created_by"
-            )
-            .order_by("-created_at")
-        )
+        queryset = Consignment.objects.select_related(
+            "consignor",
+            "consignee",
+            "material_type",
+            "weight_unit",
+            "packaging_type",
+            "vehicle_type",
+            "freight_mode",
+            "from_location",
+            "to_location",
+        ).order_by("-created_at")
 
-        # Simple search/filter
         q = request.GET.get("q")
         if q:
-            qs = qs.filter(
-                Q(consignment_id__icontains=q) |
-                Q(consignor__organization_name__icontains=q) |
-                Q(consignee__organization_name__icontains=q)
+            queryset = queryset.filter(
+                Q(consignment_id__icontains=q)
+                | Q(consignor__organization_name__icontains=q)
+                | Q(consignee__organization_name__icontains=q)
             )
 
         consignor_id = request.GET.get("consignor")
         if consignor_id:
-            qs = qs.filter(consignor_id=consignor_id)
+            queryset = queryset.filter(consignor_id=consignor_id)
 
         consignee_id = request.GET.get("consignee")
         if consignee_id:
-            qs = qs.filter(consignee_id=consignee_id)
+            queryset = queryset.filter(consignee_id=consignee_id)
 
-        date_from = request.GET.get("from")
-        date_to = request.GET.get("to")
-        if date_from:
-            qs = qs.filter(created_at__date__gte=date_from)
-        if date_to:
-            qs = qs.filter(created_at__date__lte=date_to)
-
-        return Response(ConsignmentSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+        serializer = ConsignmentSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     def post(self, request):
-        ser = ConsignmentSerializer(data=request.data)
-        if not ser.is_valid():
-            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        # Build and save so model.save() runs (auto total_freight + consignment_id)
-        obj = Consignment(**ser.validated_data)
-        # obj.full_clean()  # optional: run model.clean() explicitly
-        obj.save()
-        return Response(ConsignmentSerializer(obj).data, status=status.HTTP_201_CREATED)
+        serializer = ConsignmentSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            ConsignmentSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class ConsignmentDetail(APIView):
-    """
-    GET    /api/v1/entity/consignments/<id>/   -> retrieve
-    POST   /api/v1/entity/consignments/<id>/   -> partial update (POST)
-    DELETE /api/v1/entity/consignments/<id>/   -> delete
-    """
-
     def get_object(self, pk: int):
-        return (
-            Consignment.objects
-            .select_related(
-                "consignor", "consignee",
-                "material_type", "weight_unit", "packaging_type",
-                "vehicle_type", "freight_mode", "created_by"
-            )
-            .filter(pk=pk)
-            .first()
-        )
+        return Consignment.objects.select_related("consignor", "consignee").filter(pk=pk).first()
 
     def get(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
+        instance = self.get_object(pk)
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-        return Response(ConsignmentSerializer(obj).data, status=status.HTTP_200_OK)
-
-    def post(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
-            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        ser = ConsignmentSerializer(obj, data=request.data, partial=True)
-        if not ser.is_valid():
-            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        for field, value in ser.validated_data.items():
-            setattr(obj, field, value)
-        # obj.full_clean()  # optional: run model.clean()
-        obj.save()          # re-calculates total_freight in model.save()
-        return Response(ConsignmentSerializer(obj).data, status=status.HTTP_200_OK)
-
-    def delete(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
-            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-        obj.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-class ConsignmentGroupListCreate(APIView):
-    """
-    GET  /api/v1/entity/consignment-groups/     -> list (filters)
-    POST /api/v1/entity/consignment-groups/     -> create
-    """
-
-    def get(self, request):
-        qs = (
-            ConsignmentGroup.objects
-            .prefetch_related("consignments")
-            .select_related("created_by")
-            .order_by("-created_at")
+        return Response(
+            ConsignmentSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
         )
 
-        # filters
+    def post(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = ConsignmentSerializer(
+            instance,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            ConsignmentSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def delete(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        instance.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ConsignmentRecalculateFreight(APIView):
+    def post(self, request, pk: int):
+        instance = get_object_or_404(Consignment, pk=pk)
+        instance.save()  # re-run model calculation path
+        return Response(
+            {
+                "id": instance.id,
+                "consignment_id": instance.consignment_id,
+                "total_freight": instance.total_freight,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class ConsignmentGroupListCreate(APIView):
+    def get(self, request):
+        queryset = ConsignmentGroup.objects.prefetch_related("consignments").order_by("-created_at")
         q = request.GET.get("q")
         if q:
-            qs = qs.filter(Q(group_id__icontains=q))
-
-        planned_from = request.GET.get("planned_from")
-        planned_to = request.GET.get("planned_to")
-        if planned_from:
-            qs = qs.filter(planned_dispatch_date__gte=planned_from)
-        if planned_to:
-            qs = qs.filter(planned_dispatch_date__lte=planned_to)
-
-        return Response(ConsignmentGroupSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+            queryset = queryset.filter(group_id__icontains=q)
+        serializer = ConsignmentGroupSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     def post(self, request):
-        ser = ConsignmentGroupSerializer(data=request.data)
-        if not ser.is_valid():
-            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
-        obj = ser.save()  # create() handles M2M + totals
-        return Response(ConsignmentGroupSerializer(obj).data, status=status.HTTP_201_CREATED)
+        serializer = ConsignmentGroupSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            ConsignmentGroupSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class ConsignmentGroupDetail(APIView):
-    """
-    GET    /api/v1/entity/consignment-groups/<id>/    -> retrieve
-    POST   /api/v1/entity/consignment-groups/<id>/    -> partial update (POST)
-    DELETE /api/v1/entity/consignment-groups/<id>/    -> delete
-    """
-
     def get_object(self, pk: int):
-        return (
-            ConsignmentGroup.objects
-            .prefetch_related("consignments")
-            .select_related("created_by")
-            .filter(pk=pk)
-            .first()
-        )
+        return ConsignmentGroup.objects.prefetch_related("consignments").filter(pk=pk).first()
 
     def get(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
+        instance = self.get_object(pk)
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-        return Response(ConsignmentGroupSerializer(obj).data, status=status.HTTP_200_OK)
+        return Response(
+            ConsignmentGroupSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
     def post(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
+        instance = self.get_object(pk)
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        ser = ConsignmentGroupSerializer(obj, data=request.data, partial=True)
-        if not ser.is_valid():
-            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
-        obj = ser.save()  # update() handles M2M + totals (if consignments provided)
-        return Response(ConsignmentGroupSerializer(obj).data, status=status.HTTP_200_OK)
+        serializer = ConsignmentGroupSerializer(
+            instance,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            ConsignmentGroupSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
     def delete(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
+        instance = self.get_object(pk)
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-        obj.delete()
+        instance.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
+
+class ConsignmentGroupRecalculateTotals(APIView):
+    def post(self, request, pk: int):
+        instance = get_object_or_404(ConsignmentGroup, pk=pk)
+        instance.calculate_totals()
+        return Response(
+            {
+                "id": instance.id,
+                "group_id": instance.group_id,
+                "total_weight": instance.total_weight,
+                "total_amount": instance.total_amount,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class ShipmentListCreate(APIView):
-    """
-    GET  /api/v1/entity/shipments/        -> list (filters)
-    POST /api/v1/entity/shipments/        -> create
-    """
-
     def get(self, request):
-        qs = (
-            Shipment.objects
-            .select_related(
-                "consignment_group", "vehicle", "driver", "co_driver",
-                "transporter", "broker", "planned_route", "actual_route", "created_by"
-            )
-            .order_by("-created_at")
-        )
+        queryset = Shipment.objects.select_related(
+            "consignment_group",
+            "vehicle",
+            "driver",
+            "co_driver",
+            "transporter",
+            "broker",
+            "planned_route",
+            "actual_route",
+        ).order_by("-created_at")
 
-        # Filters
         q = request.GET.get("q")
         if q:
-            qs = qs.filter(
-                Q(shipment_id__icontains=q) |
-                Q(consignment_group__group_id__icontains=q) |
-                Q(vehicle__registration_number__icontains=q)
+            queryset = queryset.filter(
+                Q(shipment_id__icontains=q)
+                | Q(consignment_group__group_id__icontains=q)
+                | Q(vehicle__registration_number__icontains=q)
             )
 
-        group_id = request.GET.get("consignment_group")
-        if group_id:
-            qs = qs.filter(consignment_group_id=group_id)
+        vehicle = request.GET.get("vehicle")
+        if vehicle:
+            queryset = queryset.filter(vehicle_id=vehicle)
 
-        vehicle_id = request.GET.get("vehicle")
-        if vehicle_id:
-            qs = qs.filter(vehicle_id=vehicle_id)
+        driver = request.GET.get("driver")
+        if driver:
+            queryset = queryset.filter(driver_id=driver)
 
-        driver_id = request.GET.get("driver")
-        if driver_id:
-            qs = qs.filter(driver_id=driver_id)
+        status_value = request.GET.get("status")
+        if status_value:
+            queryset = queryset.filter(status_logs__status__internal_value=status_value).distinct()
 
-        date_from = request.GET.get("from")
-        date_to = request.GET.get("to")
-        if date_from:
-            qs = qs.filter(created_at__date__gte=date_from)
-        if date_to:
-            qs = qs.filter(created_at__date__lte=date_to)
-
-        return Response(ShipmentSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+        serializer = ShipmentSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     def post(self, request):
-        ser = ShipmentSerializer(data=request.data)
-        if not ser.is_valid():
-            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        # Construct then save so your model logic runs (ID gen, totals, distance)
-        obj = Shipment(**ser.validated_data)
-        obj.save()  # model.save() will set shipment_id, total_distance, total_freight_amount
-        return Response(ShipmentSerializer(obj).data, status=status.HTTP_201_CREATED)
+        serializer = ShipmentSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            ShipmentSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class ShipmentDetail(APIView):
-    """
-    GET    /api/v1/entity/shipments/<id>/   -> retrieve
-    POST   /api/v1/entity/shipments/<id>/   -> partial update (POST)
-    DELETE /api/v1/entity/shipments/<id>/   -> delete
-    """
-
     def get_object(self, pk: int):
-        return (
-            Shipment.objects
-            .select_related(
-                "consignment_group", "vehicle", "driver", "co_driver",
-                "transporter", "broker", "planned_route", "actual_route", "created_by"
-            )
-            .filter(pk=pk)
-            .first()
-        )
+        return Shipment.objects.select_related("consignment_group", "vehicle", "driver").filter(pk=pk).first()
 
     def get(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
+        instance = self.get_object(pk)
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-        return Response(ShipmentSerializer(obj).data, status=status.HTTP_200_OK)
+        return Response(
+            ShipmentSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
     def post(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
+        instance = self.get_object(pk)
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        ser = ShipmentSerializer(obj, data=request.data, partial=True)
-        if not ser.is_valid():
-            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        for field, value in ser.validated_data.items():
-            setattr(obj, field, value)
-        obj.save()  # recalculates distance & totals; preserves shipment_id
-        return Response(ShipmentSerializer(obj).data, status=status.HTTP_200_OK)
+        serializer = ShipmentSerializer(
+            instance,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            ShipmentSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
     def delete(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
+        instance = self.get_object(pk)
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-        obj.delete()
+        instance.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+class ShipmentCalculateTotals(APIView):
+    def post(self, request, pk: int):
+        shipment = get_object_or_404(Shipment, pk=pk)
+        shipment.calculate_totals()
+        return Response(
+            {
+                "id": shipment.id,
+                "shipment_id": shipment.shipment_id,
+                "total_freight_amount": shipment.total_freight_amount,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
-from django.contrib.contenttypes.models import ContentType
+class ShipmentCalculateDistance(APIView):
+    def post(self, request, pk: int):
+        shipment = get_object_or_404(Shipment, pk=pk)
+        total_distance = shipment.calculate_distance()
+        shipment.save(update_fields=["total_distance"])
+        return Response(
+            {
+                "id": shipment.id,
+                "shipment_id": shipment.shipment_id,
+                "total_distance": total_distance,
+            },
+            status=status.HTTP_200_OK,
+        )
 
+
+class ShipmentNextLRPreview(APIView):
+    def get(self, request):
+        shipment_id = request.GET.get("shipment_id")
+        exclude_pk = int(shipment_id) if shipment_id and shipment_id.isdigit() else None
+        return Response({"lr_no": Shipment.get_next_lr_no(exclude_pk=exclude_pk)}, status=status.HTTP_200_OK)
+
+
+class ShipmentLRPdfView(APIView):
+    def get(self, request, pk: int):
+        shipment = get_object_or_404(
+            Shipment.objects.select_related(
+                "consignment_group",
+                "vehicle",
+                "driver",
+            ).prefetch_related(
+                "consignment_group__consignments__consignor",
+                "consignment_group__consignments__consignee",
+                "consignment_group__consignments__from_location",
+                "consignment_group__consignments__to_location",
+                "consignment_group__consignments__material_type",
+                "consignment_group__consignments__weight_unit",
+            ),
+            pk=pk,
+        )
+
+        consignments = shipment.consignment_group.consignments.all() if shipment.consignment_group else []
+        total_amount = shipment.total_freight_amount or Decimal("0")
+        advance = shipment.freight_advance or Decimal("0")
+        to_pay = total_amount - advance
+
+        signature_uri = None
+        signature_path = Path(settings.BASE_DIR) / "operations" / "static" / "images" / "authorized_signature.png"
+        if signature_path.exists():
+            with open(signature_path, "rb") as image_file:
+                signature_uri = "data:image/png;base64," + base64.b64encode(image_file.read()).decode("utf-8")
+
+        html = render_to_string(
+            "admin/shipments/shipment_invoice.html",
+            {
+                "shipment": shipment,
+                "consignments": consignments,
+                "total_amount": total_amount,
+                "advance": advance,
+                "to_pay": to_pay,
+                "signature_uri": signature_uri,
+            },
+        )
+
+        output = BytesIO()
+        pdf = pisa.pisaDocument(BytesIO(html.encode("utf-8")), output)
+        if pdf.err:
+            return Response({"detail": "Error generating PDF"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        response = HttpResponse(output.getvalue(), content_type="application/pdf")
+        response["Content-Disposition"] = f'inline; filename="shipment_invoice_{shipment.shipment_id}.pdf"'
+        return response
 
 
 class ShipmentExpenseListCreate(APIView):
-    """
-    GET  /api/v1/entity/shipment-expenses/       -> list (filters)
-    POST /api/v1/entity/shipment-expenses/       -> create (supports multipart for file)
-    """
-
     def get(self, request):
-        qs = (
-            ShipmentExpense.objects
-            .select_related("shipment", "expense_type", "content_type")
-            .order_by("-expense_date", "-id")
+        queryset = ShipmentExpense.objects.select_related("shipment", "expense_type", "content_type").order_by(
+            "-expense_date",
+            "-id",
         )
 
-        # Filters
         shipment_id = request.GET.get("shipment")
         if shipment_id:
-            qs = qs.filter(shipment_id=shipment_id)
+            queryset = queryset.filter(shipment_id=shipment_id)
 
-        expense_type = request.GET.get("expense_type")
-        if expense_type:
-            qs = qs.filter(expense_type_id=expense_type)
+        expense_type_id = request.GET.get("expense_type")
+        if expense_type_id:
+            queryset = queryset.filter(expense_type_id=expense_type_id)
 
-        # Filter by who spent: driver or owner organization
         driver_id = request.GET.get("driver")
         if driver_id:
-            ct_driver = ContentType.objects.filter(app_label="entity", model="driver").first()
-            if ct_driver:
-                qs = qs.filter(content_type=ct_driver, object_id=driver_id)
+            driver_ct = ContentType.objects.get_for_model(Driver)
+            queryset = queryset.filter(content_type=driver_ct, object_id=driver_id)
 
         owner_id = request.GET.get("owner")
         if owner_id:
-            try:
-                owner = Organization.objects.get(pk=owner_id, organization_type__internal_value='OWNER')
-            except Organization.DoesNotExist:
-                qs = qs.none()
-            else:
-                ct_owner = ContentType.objects.get_for_model(Organization)
-                qs = qs.filter(content_type=ct_owner, object_id=owner.id)
+            owner_ct = ContentType.objects.get_for_model(Organization)
+            queryset = queryset.filter(content_type=owner_ct, object_id=owner_id)
 
-        # Date range
-        date_from = request.GET.get("from")
-        date_to = request.GET.get("to")
-        if date_from:
-            qs = qs.filter(expense_date__gte=date_from)
-        if date_to:
-            qs = qs.filter(expense_date__lte=date_to)
-
-        return Response(ShipmentExpenseSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+        serializer = ShipmentExpenseSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     def post(self, request):
-        """
-        Create a ShipmentExpense.
-        - If uploading 'shipment_expense_document', use multipart/form-data.
-        - Otherwise JSON is fine.
-        """
-        ser = ShipmentExpenseSerializer(data=request.data)
-        if not ser.is_valid():
-            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        obj = ser.save()
-        return Response(ShipmentExpenseSerializer(obj).data, status=status.HTTP_201_CREATED)
+        serializer = ShipmentExpenseSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            ShipmentExpenseSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class ShipmentExpenseDetail(APIView):
-    """
-    GET    /api/v1/entity/shipment-expenses/<id>/    -> retrieve
-    POST   /api/v1/entity/shipment-expenses/<id>/    -> partial update (POST)
-    DELETE /api/v1/entity/shipment-expenses/<id>/    -> delete
-    """
-
     def get_object(self, pk: int):
-        return (
-            ShipmentExpense.objects
-            .select_related("shipment", "expense_type", "content_type")
-            .filter(pk=pk)
-            .first()
-        )
+        return ShipmentExpense.objects.select_related("shipment", "expense_type", "content_type").filter(pk=pk).first()
 
     def get(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
+        instance = self.get_object(pk)
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-        return Response(ShipmentExpenseSerializer(obj).data, status=status.HTTP_200_OK)
+        return Response(
+            ShipmentExpenseSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
     def post(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
+        instance = self.get_object(pk)
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        ser = ShipmentExpenseSerializer(obj, data=request.data, partial=True)
-        if not ser.is_valid():
-            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        obj = ser.save()
-        return Response(ShipmentExpenseSerializer(obj).data, status=status.HTTP_200_OK)
+        serializer = ShipmentExpenseSerializer(
+            instance,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            ShipmentExpenseSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
     def delete(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
+        instance = self.get_object(pk)
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-        obj.delete()
+        instance.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-
-
-
-class DriverAdvanceListCreate(APIView):
-    """
-    GET  /api/v1/entity/driver-advances/         -> list (filters)
-    POST /api/v1/entity/driver-advances/         -> create
-    """
-
+class ShipmentExpenseByAutocomplete(APIView):
     def get(self, request):
-        qs = (
-            DriverAdvance.objects
-            .select_related("driver", "shipment")
-            .order_by("-date", "-id")
-        )
+        term = (request.GET.get("term") or request.GET.get("q") or "").strip()
+        results = []
 
-        # filters
-        driver_id = request.GET.get("driver")
-        if driver_id:
-            qs = qs.filter(driver_id=driver_id)
+        drivers = Driver.objects.all()
+        if term:
+            drivers = drivers.filter(
+                Q(first_name__icontains=term)
+                | Q(last_name__icontains=term)
+                | Q(phone_number__icontains=term)
+            )
+        for driver in drivers.order_by("first_name", "last_name")[:20]:
+            results.append(
+                {
+                    "id": f"driver_{driver.id}",
+                    "text": f"Driver: {driver.first_name} {(driver.last_name or '').strip()}".strip(),
+                }
+            )
+
+        owners = Organization.objects.filter(organization_type__internal_value="OWNER")
+        if term:
+            owners = owners.filter(organization_name__icontains=term)
+        for owner in owners.order_by("organization_name")[:20]:
+            results.append({"id": f"owner_{owner.id}", "text": f"Owner: {owner.organization_name}"})
+
+        return Response({"results": results}, status=status.HTTP_200_OK)
+
+
+class ShipmentStatusListCreate(APIView):
+    def get(self, request):
+        queryset = ShipmentStatus.objects.select_related("shipment", "status", "shipment_doc_type").order_by(
+            "-effective_date",
+            "-id",
+        )
 
         shipment_id = request.GET.get("shipment")
         if shipment_id:
-            qs = qs.filter(shipment_id=shipment_id)
+            queryset = queryset.filter(shipment_id=shipment_id)
 
-        date_from = request.GET.get("from")
-        date_to = request.GET.get("to")
-        if date_from:
-            qs = qs.filter(date__gte=date_from)
-        if date_to:
-            qs = qs.filter(date__lte=date_to)
+        status_id = request.GET.get("status")
+        if status_id:
+            queryset = queryset.filter(status_id=status_id)
 
-        q = request.GET.get("q")
-        if q:
-            qs = qs.filter(Q(description__icontains=q))
-
-        return Response(DriverAdvanceSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+        serializer = ShipmentStatusSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     def post(self, request):
-        """
-        Create a DriverAdvance.
-        - If you want to carry-forward previous unsettled balance automatically,
-          pass {"use_carry_forward": true} in the payload.
-        """
-        use_cf = str(request.data.get("use_carry_forward", "")).lower() in ("1","true","yes")
-        if use_cf:
-            # use your convenience constructor
-            try:
-                driver = Driver.objects.get(pk=request.data.get("driver"))
-            except Driver.DoesNotExist:
-                return Response({"driver": "Invalid driver id."}, status=status.HTTP_400_BAD_REQUEST)
-            shipment = None
-            if request.data.get("shipment"):
-                try:
-                    shipment = Shipment.objects.get(pk=request.data.get("shipment"))
-                except Shipment.DoesNotExist:
-                    return Response({"shipment": "Invalid shipment id."}, status=status.HTTP_400_BAD_REQUEST)
-            amount = request.data.get("amount")
-            desc = request.data.get("description", "")
-            if amount is None:
-                return Response({"amount": "This field is required."}, status=status.HTTP_400_BAD_REQUEST)
-            obj = DriverAdvance.create_driver_advance(driver=driver, shipment=shipment, amount=amount, description=desc)
-            return Response(DriverAdvanceSerializer(obj).data, status=status.HTTP_201_CREATED)
+        serializer = ShipmentStatusSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        _apply_status_to_shipment(instance)
+        return Response(
+            ShipmentStatusSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
-        # plain create
-        ser = DriverAdvanceSerializer(data=request.data)
-        if not ser.is_valid():
-            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
-        obj = ser.save()
-        return Response(DriverAdvanceSerializer(obj).data, status=status.HTTP_201_CREATED)
+
+class ShipmentStatusDetail(APIView):
+    def get_object(self, pk: int):
+        return ShipmentStatus.objects.select_related("shipment", "status", "shipment_doc_type").filter(pk=pk).first()
+
+    def get(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            ShipmentStatusSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def post(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = ShipmentStatusSerializer(
+            instance,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        _apply_status_to_shipment(instance)
+        return Response(
+            ShipmentStatusSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    def delete(self, request, pk: int):
+        instance = self.get_object(pk)
+        if not instance:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        instance.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class DriverAdvanceListCreate(APIView):
+    def get(self, request):
+        queryset = DriverAdvance.objects.select_related("driver", "shipment", "content_type").order_by("-date", "-id")
+
+        driver_id = request.GET.get("driver")
+        if driver_id:
+            queryset = queryset.filter(driver_id=driver_id)
+
+        shipment_id = request.GET.get("shipment")
+        if shipment_id:
+            queryset = queryset.filter(shipment_id=shipment_id)
+
+        serializer = DriverAdvanceSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        use_carry_forward = str(request.data.get("use_carry_forward", "")).lower() in {"1", "true", "yes"}
+        if use_carry_forward:
+            driver_id = request.data.get("driver")
+            driver = Driver.objects.filter(pk=driver_id).first()
+            if not driver:
+                return Response({"driver": "Invalid driver id."}, status=status.HTTP_400_BAD_REQUEST)
+
+            shipment = None
+            shipment_id = request.data.get("shipment")
+            if shipment_id:
+                shipment = Shipment.objects.filter(pk=shipment_id).first()
+                if not shipment:
+                    return Response({"shipment": "Invalid shipment id."}, status=status.HTTP_400_BAD_REQUEST)
+
+            amount = request.data.get("amount")
+            if amount in (None, ""):
+                return Response({"amount": "This field is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+            instance = DriverAdvance.create_driver_advance(
+                driver=driver,
+                shipment=shipment,
+                amount=amount,
+                description=request.data.get("description", ""),
+            )
+            return Response(
+                DriverAdvanceSerializer(instance, context={"request": request}).data,
+                status=status.HTTP_201_CREATED,
+            )
+
+        serializer = DriverAdvanceSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            DriverAdvanceSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class DriverAdvanceDetail(APIView):
-    """
-    GET    /api/v1/entity/driver-advances/<id>/   -> retrieve
-    POST   /api/v1/entity/driver-advances/<id>/   -> partial update (POST)
-    DELETE /api/v1/entity/driver-advances/<id>/   -> delete
-    """
-
     def get_object(self, pk: int):
-        return DriverAdvance.objects.select_related("driver", "shipment").filter(pk=pk).first()
+        return DriverAdvance.objects.select_related("driver", "shipment", "content_type").filter(pk=pk).first()
 
     def get(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
+        instance = self.get_object(pk)
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-        return Response(DriverAdvanceSerializer(obj).data, status=status.HTTP_200_OK)
+        return Response(
+            DriverAdvanceSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
     def post(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
+        instance = self.get_object(pk)
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-        ser = DriverAdvanceSerializer(obj, data=request.data, partial=True)
-        if not ser.is_valid():
-            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
-        obj = ser.save()
-        return Response(DriverAdvanceSerializer(obj).data, status=status.HTTP_200_OK)
+        serializer = DriverAdvanceSerializer(
+            instance,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            DriverAdvanceSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
     def delete(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
+        instance = self.get_object(pk)
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-        obj.delete()
+        instance.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class DriverAdvanceSettle(APIView):
-    """
-    POST /api/v1/entity/driver-advances/<id>/settle/
-    Runs settle_and_carry_forward() and returns the updated record.
-    """
-
     def post(self, request, pk: int):
-        obj = DriverAdvance.objects.filter(pk=pk).first()
-        if not obj:
+        instance = DriverAdvance.objects.filter(pk=pk).first()
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-        obj.settle_and_carry_forward()
-        return Response(DriverAdvanceSerializer(obj).data, status=status.HTTP_200_OK)
+        instance.settle_and_carry_forward()
+        return Response(
+            DriverAdvanceSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
 
 class DriverAdvanceSummary(APIView):
-    """
-    GET /api/v1/entity/driver-advances/summary?driver=<id>[&shipment=<id>]
-    Returns get_driver_summary(driver, shipment)
-    """
-
     def get(self, request):
         driver_id = request.GET.get("driver")
         if not driver_id:
             return Response({"driver": "This query param is required."}, status=status.HTTP_400_BAD_REQUEST)
-        try:
-            driver = Driver.objects.get(pk=driver_id)
-        except Driver.DoesNotExist:
+
+        driver = Driver.objects.filter(pk=driver_id).first()
+        if not driver:
             return Response({"driver": "Invalid driver id."}, status=status.HTTP_400_BAD_REQUEST)
 
         shipment = None
         shipment_id = request.GET.get("shipment")
         if shipment_id:
-            try:
-                shipment = Shipment.objects.get(pk=shipment_id)
-            except Shipment.DoesNotExist:
+            shipment = Shipment.objects.filter(pk=shipment_id).first()
+            if not shipment:
                 return Response({"shipment": "Invalid shipment id."}, status=status.HTTP_400_BAD_REQUEST)
 
-        data = DriverAdvance.get_driver_summary(driver, shipment)
-        return Response(data, status=status.HTTP_200_OK)
+        return Response(DriverAdvance.get_driver_summary(driver, shipment), status=status.HTTP_200_OK)
 
-class ShipmentStatusListCreate(APIView):
-    """
-    GET  /api/v1/entity/shipment-status/       -> list (filters)
-    POST /api/v1/entity/shipment-status/       -> create (supports multipart for file)
-    """
 
-    def get(self, request):
-        qs = (
-            ShipmentStatus.objects
-            .select_related("shipment", "status", "shipment_doc_type")
-            .order_by("-timestamp", "-id")
+class DriverLedgerView(APIView):
+    def get(self, request, driver_id: int):
+        driver = get_object_or_404(Driver, pk=driver_id)
+        from_date = request.GET.get("from")
+        to_date = request.GET.get("to")
+        ledger = _build_driver_ledger(driver, from_date=from_date, to_date=to_date)
+        return Response(ledger, status=status.HTTP_200_OK)
+
+
+class DriverLedgerExcelView(APIView):
+    def get(self, request, driver_id: int):
+        driver = get_object_or_404(Driver, pk=driver_id)
+        ledger = _build_driver_ledger(
+            driver,
+            from_date=request.GET.get("from"),
+            to_date=request.GET.get("to"),
         )
 
-        # Filters
-        shipment_id = request.GET.get("shipment")
-        if shipment_id:
-            qs = qs.filter(shipment_id=shipment_id)
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "Driver Ledger"
+        sheet.append(
+            [
+                "Date",
+                "Type",
+                "Shipment",
+                "Debit (₹)",
+                "Credit (₹)",
+                "Running Balance (₹)",
+                "Description",
+            ]
+        )
+        for row in ledger["rows"]:
+            sheet.append(
+                [
+                    row["date"],
+                    row["type"],
+                    row["shipment"],
+                    float(row["debit"]),
+                    float(row["credit"]),
+                    float(row["running_balance"]),
+                    row["description"],
+                ]
+            )
 
-        status_id = request.GET.get("status")
-        if status_id:
-            qs = qs.filter(status_id=status_id)
+        response = HttpResponse(
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        response["Content-Disposition"] = f'attachment; filename="driver_ledger_{driver_id}.xlsx"'
+        workbook.save(response)
+        return response
 
-        date_from = request.GET.get("from")
-        date_to   = request.GET.get("to")
-        if date_from:
-            qs = qs.filter(timestamp__date__gte=date_from)
-        if date_to:
-            qs = qs.filter(timestamp__date__lte=date_to)
 
-        q = request.GET.get("q")
-        if q:
-            qs = qs.filter(Q(updated_by__icontains=q) | Q(notes__icontains=q))
+class DieselListCreate(APIView):
+    def get(self, request):
+        queryset = Diesel.objects.select_related("vehicle", "driver", "location").order_by("-date", "-id")
 
-        return Response(ShipmentStatusSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+        vehicle = request.GET.get("vehicle")
+        if vehicle:
+            queryset = queryset.filter(vehicle_id=vehicle)
+        driver = request.GET.get("driver")
+        if driver:
+            queryset = queryset.filter(driver_id=driver)
+        payment_mode = request.GET.get("payment_mode")
+        if payment_mode:
+            queryset = queryset.filter(payment_mode=payment_mode)
+
+        serializer = DieselSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     def post(self, request):
-        """
-        Create a ShipmentStatus.
-        - If uploading 'shipment_document', use multipart/form-data.
-        - Otherwise JSON is fine.
-        """
-        ser = ShipmentStatusSerializer(data=request.data)
-        if not ser.is_valid():
-            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        obj = ser.save()
-        return Response(ShipmentStatusSerializer(obj).data, status=status.HTTP_201_CREATED)
-
-
-class ShipmentStatusDetail(APIView):
-    """
-    GET    /api/v1/entity/shipment-status/<id>/   -> retrieve
-    POST   /api/v1/entity/shipment-status/<id>/   -> partial update (POST)
-    DELETE /api/v1/entity/shipment-status/<id>/   -> delete
-    """
-
-    def get_object(self, pk: int):
-        return (
-            ShipmentStatus.objects
-            .select_related("shipment", "status", "shipment_doc_type")
-            .filter(pk=pk)
-            .first()
+        serializer = DieselSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            DieselSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
         )
 
+
+class DieselDetail(APIView):
+    def get_object(self, pk: int):
+        return Diesel.objects.select_related("vehicle", "driver", "location").filter(pk=pk).first()
+
     def get(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
+        instance = self.get_object(pk)
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-        return Response(ShipmentStatusSerializer(obj).data, status=status.HTTP_200_OK)
+        return Response(
+            DieselSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
     def post(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
+        instance = self.get_object(pk)
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        ser = ShipmentStatusSerializer(obj, data=request.data, partial=True)
-        if not ser.is_valid():
-            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        obj = ser.save()
-        return Response(ShipmentStatusSerializer(obj).data, status=status.HTTP_200_OK)
+        serializer = DieselSerializer(
+            instance,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            DieselSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
     def delete(self, request, pk: int):
-        obj = self.get_object(pk)
-        if not obj:
+        instance = self.get_object(pk)
+        if not instance:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
-        obj.delete()
+        instance.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class DieselSummary(APIView):
+    def get(self, request):
+        queryset = Diesel.objects.all()
+        totals = queryset.aggregate(
+            total_qty=Sum("quantity"),
+            total_amount=Sum("total_price"),
+            total_payment=Sum("payment"),
+        )
+        return Response(totals, status=status.HTTP_200_OK)
