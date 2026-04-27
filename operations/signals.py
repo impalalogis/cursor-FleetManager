@@ -99,9 +99,10 @@ def _sync_diesel_transaction(instance: Diesel):
             "category": "fuel",
             "amount": amount,
             "transaction_date": instance.date,
-            "driver": instance.driver,
+            # Diesel is a driver-side expense only when paid in cash by driver.
+            "driver": instance.driver if instance.payment_mode == "CASH" else None,
             "vehicle": instance.vehicle,
-            "description": f"Diesel expense for record #{instance.pk}",
+            "description": f"Diesel ({instance.payment_mode.lower()}) expense for record #{instance.pk}",
         },
     )
 
@@ -260,12 +261,19 @@ def sync_diesel_finance(sender, instance: Diesel, **kwargs):
     cash_amount = _as_decimal(instance.driver_taken_cash)
     driver = instance.driver
 
+    # Driver advance should be deducted only when diesel payment is CASH.
+    diesel_debit = (
+        diesel_amount
+        if driver and instance.payment_mode == "CASH" and diesel_amount > 0
+        else Decimal("0")
+    )
+
     affected_driver_ids = set()
     affected_driver_ids |= _sync_ledger_entry(
         kind=LEDGER_KIND_DIESEL_EXPENSE,
         source_id=instance.pk,
         driver=driver,
-        amount=-diesel_amount if diesel_amount > 0 else Decimal("0"),
+        amount=-diesel_debit if diesel_debit > 0 else Decimal("0"),
         entry_date=instance.date,
         description=f"Diesel expense deduction (Diesel#{instance.pk})",
         shipment=None,
