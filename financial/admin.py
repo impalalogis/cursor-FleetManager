@@ -3,9 +3,8 @@ from django.utils import timezone
 from django.utils.safestring import mark_safe
 from django.utils.html import format_html
 from django.contrib import messages
-from django.http import HttpResponseRedirect
 from django.db.models import Count
-from .models import Invoice, Payment, Transaction, OfficeExpense, BankTransfer
+from .models import Invoice, Payment, Transaction, OfficeExpense
 from .admin_mixins import NavigationButtonMixin
 from django.http import HttpResponse
 from django.template.loader import render_to_string

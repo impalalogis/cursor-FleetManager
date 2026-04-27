@@ -1,10 +1,16 @@
 # operations/forms.py
+import logging
+
 from django import forms
-from .models import ShipmentExpense
 from django.contrib.contenttypes.models import ContentType
-from entity.models import Organization, Driver
-from operations.models import Shipment
-from .models import DriverAdvance
+from django.db import DatabaseError
+from django.core.exceptions import ObjectDoesNotExist
+from django.urls import reverse
+
+from entity.models import Driver, Organization
+from .models import DriverAdvance, ShipmentExpense
+
+logger = logging.getLogger(__name__)
 
 class DriverOwnerChoiceField(forms.ChoiceField):
     """
@@ -32,9 +38,9 @@ class DriverOwnerChoiceField(forms.ChoiceField):
             owners = Organization.objects.filter(organization_type__internal_value='OWNER').order_by('organization_name')
             for owner in owners:
                 choices.append((f'owner_{owner.id}', f'Owner: {owner.organization_name}'))
-        except Exception:
+        except (DatabaseError, ObjectDoesNotExist):
             # If database is not available, return empty choices
-            pass
+            logger.exception("Failed to build Driver/Owner choices for ShipmentExpense form")
         
         return choices
     
@@ -65,8 +71,6 @@ class DriverOwnerChoiceField(forms.ChoiceField):
                 raise forms.ValidationError("Invalid selection format")
         except ValueError:
             raise forms.ValidationError("Invalid ID format")
-        except Exception as e:
-            raise forms.ValidationError(f"Error processing selection: {str(e)}")
 
 
 class ShipmentExpenseForm(forms.ModelForm):
@@ -98,8 +102,9 @@ class ShipmentExpenseForm(forms.ModelForm):
         # Update the custom field choices when form is actually instantiated
         try:
             self.fields['expense_by_combined'].choices = self.fields['expense_by_combined'].get_choices()
-        except Exception:
+        except (DatabaseError, ObjectDoesNotExist):
             # If database is not available, keep empty choices
+            logger.exception("Failed to populate expense_by_combined choices")
             self.fields['expense_by_combined'].choices = [('', '---------')]
         
         # If editing an existing instance, pre-populate the combined field
@@ -138,13 +143,6 @@ class ShipmentExpenseForm(forms.ModelForm):
         if commit:
             instance.save()
         return instance
-
-# forms.py
-from django import forms
-from django.contrib.contenttypes.models import ContentType
-from entity.models import Organization
-from operations.models import ShipmentExpense  # only if needed elsewhere
-from .models import DriverAdvance
 
 class DriverAdvanceAdminForm(forms.ModelForm):
     RELATED_CHOICES = (
@@ -228,9 +226,6 @@ class DriverAdvanceAdminForm(forms.ModelForm):
         return cleaned
 
 
-
-from django import forms
-from django.urls import reverse
 
 class ExpenseBySelect2Widget(forms.Select):
     class Media:

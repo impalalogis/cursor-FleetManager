@@ -9,7 +9,6 @@ from entity.models import (
 )
 from operations.models import DriverAdvance, ShipmentExpense
 from maintenance.models import MaintenanceRecord, TyreTransaction
-from configuration.models import BankingDetail
 from django.utils.html import format_html
 
 class DriverAdvanceInline(admin.TabularInline):
@@ -137,8 +136,7 @@ class DriverAdmin(admin.ModelAdmin):
 
     list_filter = ('gender', 'owner')
     readonly_fields = ('age', 'locality', 'district', 'state', 'country', 'city')
-    inlines = getattr(locals().get('DriverAdmin'), 'inlines', []) or []
-    inlines = inlines + [DriverDocumentInline]
+    inlines = [DriverDocumentInline]
 @admin.register(Organization)
 class OrganizationAdmin(admin.ModelAdmin):
     fieldsets = (
