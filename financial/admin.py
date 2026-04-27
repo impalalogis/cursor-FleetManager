@@ -4,6 +4,7 @@ from django.utils.safestring import mark_safe
 from django.utils.html import format_html
 from django.contrib import messages
 from django.http import HttpResponseRedirect
+from django.db.models import Count
 from .models import Invoice, Payment, Transaction, OfficeExpense, BankTransfer
 from .admin_mixins import NavigationButtonMixin
 from django.http import HttpResponse
@@ -418,6 +419,8 @@ class InvoiceAdmin(NavigationButtonMixin, admin.ModelAdmin):
             'payments',
             'shipment__expenses',
             # 'shipment__driver_advances'
+        ).annotate(
+            payments_count=Count('payments'),
         )
 
 
@@ -929,7 +932,10 @@ class InvoiceAdmin(NavigationButtonMixin, admin.ModelAdmin):
 
     @admin.display(description="Next", ordering=None)
     def next_step_list_button(self, obj):
-        payment = obj.payments.first()  # related_name='payments'
+        payment = getattr(obj, "_first_payment_cached", None)
+        if payment is None:
+            payment = obj.payments.first()  # related_name='payments'
+            obj._first_payment_cached = payment
 
         if payment:
             return self.nav_button(
@@ -946,7 +952,9 @@ class InvoiceAdmin(NavigationButtonMixin, admin.ModelAdmin):
 
     @admin.display(description="Payments", ordering=None)
     def payment_buttons(self, obj):
-        count = obj.payments.count()
+        count = getattr(obj, "payments_count", None)
+        if count is None:
+            count = obj.payments.count()
 
         if count == 0:
             # Only "Add Payment"
@@ -974,7 +982,9 @@ class InvoiceAdmin(NavigationButtonMixin, admin.ModelAdmin):
     def change_view(self, request, object_id, form_url='', extra_context=None):
         obj = self.get_object(request, object_id)
 
-        payment_count = obj.payments.count() if obj else 0
+        payment_count = getattr(obj, "payments_count", None) if obj else 0
+        if obj and payment_count is None:
+            payment_count = obj.payments.count()
 
         add_payment_url = reverse("admin:financial_payment_add") + f"?invoice={obj.pk}"
         view_payment_url = reverse("admin:financial_payment_changelist") + f"?invoice__id__exact={obj.pk}"

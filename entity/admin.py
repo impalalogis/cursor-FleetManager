@@ -32,7 +32,13 @@ class ShipmentExpenseInline(admin.TabularInline):
         # Get ContentType for Driver model
         from django.contrib.contenttypes.models import ContentType
         driver_ct = ContentType.objects.get_for_model(Driver)
-        return qs.filter(content_type=driver_ct)
+        qs = qs.filter(content_type=driver_ct)
+
+        # In Driver change view, scope inline rows to this specific driver.
+        object_id = getattr(getattr(request, "resolver_match", None), "kwargs", {}).get("object_id")
+        if object_id:
+            qs = qs.filter(object_id=object_id)
+        return qs
 
     def has_add_permission(self, request, obj=None):
         """Disable adding new expenses through this inline to avoid confusion"""

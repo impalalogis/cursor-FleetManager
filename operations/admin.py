@@ -1,4 +1,4 @@
-from django.db.models import Sum
+from django.db.models import Sum, Prefetch
 from decimal import Decimal
 from django.urls import reverse
 from django.db.models import Count
@@ -929,6 +929,31 @@ class ShipmentAdmin(NavigationButtonMixin, admin.ModelAdmin):
 
         if status:
             qs = qs.filter(status_logs__status__internal_value=status)
+            qs = qs.distinct()
+
+        qs = qs.annotate(
+            status_count=Count('status_logs', distinct=True),
+            expense_count=Count('expenses', distinct=True),
+            first_invoice_id=models.Min('invoices__id'),
+        )
+
+        status_prefetch = Prefetch(
+            'status_logs',
+            queryset=ShipmentStatus.objects.select_related('status').only(
+                'id',
+                'shipment_id',
+                'status_id',
+                'effective_date',
+                'status__internal_value',
+                'status__display_value',
+            ).order_by('-effective_date', '-id'),
+            to_attr='prefetched_status_logs',
+        )
+        expense_prefetch = Prefetch(
+            'expenses',
+            queryset=ShipmentExpense.objects.only('id', 'shipment_id').order_by('-expense_date', '-id'),
+            to_attr='prefetched_expenses',
+        )
 
         # ---------------------------------------------------------
         # RETURN WITH OPTIMIZED PREFETCH
@@ -940,11 +965,46 @@ class ShipmentAdmin(NavigationButtonMixin, admin.ModelAdmin):
             'transporter',
             'broker'
         ).prefetch_related(
-            'status_logs__status',
+            status_prefetch,
+            expense_prefetch,
             'consignment_group__consignments',
-            'vehicle',
-            'driver'
+            'consignment_group__consignments__consignor',
+            'consignment_group__consignments__consignee',
         )
+
+    def _status_entries(self, obj):
+        prefetched = getattr(obj, 'prefetched_status_logs', None)
+        if prefetched is not None:
+            return prefetched
+        return list(obj.status_logs.select_related('status').order_by('-effective_date', '-id'))
+
+    def _latest_status_entry(self, obj):
+        statuses = self._status_entries(obj)
+        return statuses[0] if statuses else None
+
+    def _status_count(self, obj):
+        count = getattr(obj, 'status_count', None)
+        if count is not None:
+            return count
+        prefetched = getattr(obj, 'prefetched_status_logs', None)
+        if prefetched is not None:
+            return len(prefetched)
+        return obj.status_logs.count()
+
+    def _expense_count(self, obj):
+        count = getattr(obj, 'expense_count', None)
+        if count is not None:
+            return count
+        prefetched = getattr(obj, 'prefetched_expenses', None)
+        if prefetched is not None:
+            return len(prefetched)
+        return obj.expenses.count()
+
+    def _first_invoice_id(self, obj):
+        invoice_id = getattr(obj, 'first_invoice_id', None)
+        if invoice_id:
+            return invoice_id
+        return obj.invoices.values_list('id', flat=True).first()
 
     @admin.display(description="Consignments")
     def consignment_count_display(self, obj):
@@ -1026,13 +1086,13 @@ class ShipmentAdmin(NavigationButtonMixin, admin.ModelAdmin):
 
     @admin.display(description="Invoice", ordering=None)
     def next_step_list_button(self, obj):
-        invoice = obj.invoices.first()  # related_name='invoices'
+        invoice_id = self._first_invoice_id(obj)
 
-        if invoice:
+        if invoice_id:
             return self.nav_button(
                 "View",
                 "admin:financial_invoice_change",  # FIXED
-                invoice.pk
+                invoice_id
             )
         else:
             return self.nav_button(
@@ -1075,10 +1135,10 @@ class ShipmentAdmin(NavigationButtonMixin, admin.ModelAdmin):
         # ---------------------------------------------------------
         # NEXT → Invoice
         # ---------------------------------------------------------
-        invoice = obj.invoices.first()
+        invoice_id = self._first_invoice_id(obj)
 
-        if invoice:
-            next_step_url = reverse("admin:financial_invoice_change", args=[invoice.pk])
+        if invoice_id:
+            next_step_url = reverse("admin:financial_invoice_change", args=[invoice_id])
             next_step_label = "View Invoice"
         else:
             next_step_url = reverse("admin:financial_invoice_add") + f"?shipment={obj.pk}"
@@ -1097,7 +1157,7 @@ class ShipmentAdmin(NavigationButtonMixin, admin.ModelAdmin):
         # ---------------------------------------------------------
         # STATUS BUTTON (View/Add)
         # ---------------------------------------------------------
-        status = obj.status_logs.first()  # correct related_name
+        status = self._latest_status_entry(obj)
 
         if status:
             status_step_url = (
@@ -1115,9 +1175,9 @@ class ShipmentAdmin(NavigationButtonMixin, admin.ModelAdmin):
         # ---------------------------------------------------------
         # EXPENSE BUTTON (View/Add)
         # ---------------------------------------------------------
-        expense = obj.expenses.first()  # correct related_name
+        expense_count = self._expense_count(obj)
 
-        if expense:
+        if expense_count > 0:
             expense_step_url = (
                     reverse("admin:operations_shipmentexpense_changelist")
                     + f"?shipment__id__exact={obj.pk}"
@@ -1151,7 +1211,7 @@ class ShipmentAdmin(NavigationButtonMixin, admin.ModelAdmin):
 
     @admin.display(description="Status", ordering=None)
     def status_step_list_button(self, obj):
-        count = obj.status_logs.count()
+        count = self._status_count(obj)
 
         if count == 0:
             return self.nav_button(
@@ -1180,7 +1240,7 @@ class ShipmentAdmin(NavigationButtonMixin, admin.ModelAdmin):
 
     @admin.display(description="Expenses", ordering=None)
     def expense_step_list_button(self, obj):
-        count = obj.expenses.count()
+        count = self._expense_count(obj)
 
         if count == 0:
             return self.nav_button(
@@ -1208,14 +1268,14 @@ class ShipmentAdmin(NavigationButtonMixin, admin.ModelAdmin):
 
     @admin.display(description="Latest Status")
     def latest_status(self, obj):
-        latest = obj.status_logs.order_by("-effective_date").first()
+        latest = self._latest_status_entry(obj)
         if latest:
             return latest.status.display_value or latest.status.name
         return "-"
 
     @admin.display(description="Latest Status")
     def latest_status_badge(self, obj):
-        latest = obj.status_logs.order_by("-effective_date").first()
+        latest = self._latest_status_entry(obj)
         if not latest:
             return "-"
 
@@ -1801,7 +1861,13 @@ class DriverAdvanceAdmin(admin.ModelAdmin):
     def driver_full_ledger(self, obj):
         request = getattr(self, "_request", None)
 
-        ledger = self._build_driver_ledger(obj.driver)
+        from_date = None
+        to_date = None
+        if request:
+            from_date = request.GET.get("from") or None
+            to_date = request.GET.get("to") or None
+
+        ledger = self._build_driver_ledger(obj.driver, from_date=from_date, to_date=to_date)
 
         opening_balance = ledger["opening_balance"]
         closing_balance = ledger["closing_balance"]
@@ -1814,9 +1880,6 @@ class DriverAdvanceAdmin(admin.ModelAdmin):
 
         filter_html = ""
         if request:
-            from_val = request.GET.get("from", "")
-            to_val = request.GET.get("to", "")
-
             request = getattr(self, "_request", None)
             # current_url = request.path if request else ""
             current_url = self._request.path
@@ -1830,8 +1893,8 @@ class DriverAdvanceAdmin(admin.ModelAdmin):
                 <a href="{export_url}" class="button" style="margin-right:10px">Download Ledger (Excel)</a>
 
                 <form method="get" action="{current_url}" style="display:inline-block">
-                    <label>From: <input type="date" name="from" value="{request.GET.get('from', '')}"></label>
-                    <label>To: <input type="date" name="to" value="{request.GET.get('to', '')}"></label>
+                    <label>From: <input type="date" name="from" value="{from_date or ''}"></label>
+                    <label>To: <input type="date" name="to" value="{to_date or ''}"></label>
                     <button type="submit" class="button">Filter</button>
                 </form>
             </div>
@@ -1893,7 +1956,11 @@ class DriverAdvanceAdmin(admin.ModelAdmin):
         driver = Driver.objects.get(pk=driver_id)
 
         # Build ledger using the same logic as driver_full_ledger()
-        ledger = self._build_driver_ledger(driver)
+        ledger = self._build_driver_ledger(
+            driver,
+            from_date=request.GET.get("from") or None,
+            to_date=request.GET.get("to") or None,
+        )
 
         wb = openpyxl.Workbook()
         ws = wb.active
@@ -1928,7 +1995,7 @@ class DriverAdvanceAdmin(admin.ModelAdmin):
         wb.save(response)
         return response
 
-    def _build_driver_ledger(self, driver):
+    def _build_driver_ledger(self, driver, from_date=None, to_date=None):
         from operations.models import ShipmentExpense
         from django.contrib.contenttypes.models import ContentType
         from decimal import Decimal
@@ -1940,7 +2007,13 @@ class DriverAdvanceAdmin(admin.ModelAdmin):
         # ---------------------------------------------------------
         # 1) DRIVER ADVANCES (CREDIT)
         # ---------------------------------------------------------
-        advances = DriverAdvance.objects.filter(driver=driver).values(
+        advances_qs = DriverAdvance.objects.filter(driver=driver)
+        if from_date:
+            advances_qs = advances_qs.filter(date__gte=from_date)
+        if to_date:
+            advances_qs = advances_qs.filter(date__lte=to_date)
+
+        advances = advances_qs.values(
             "date", "amount", "description", "shipment__shipment_id"
         )
 
@@ -1957,9 +2030,15 @@ class DriverAdvanceAdmin(admin.ModelAdmin):
         # ---------------------------------------------------------
         # 2) SHIPMENT EXPENSES (DEBIT)
         # ---------------------------------------------------------
-        expenses = ShipmentExpense.objects.filter(
+        expenses_qs = ShipmentExpense.objects.filter(
             content_type=driver_ct, object_id=driver.id
-        ).values(
+        )
+        if from_date:
+            expenses_qs = expenses_qs.filter(expense_date__gte=from_date)
+        if to_date:
+            expenses_qs = expenses_qs.filter(expense_date__lte=to_date)
+
+        expenses = expenses_qs.values(
             "expense_date", "amount", "description", "shipment__shipment_id",
             "expense_type__display_value"
         )
