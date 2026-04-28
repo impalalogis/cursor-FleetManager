@@ -259,11 +259,11 @@ class RouteSerializer(serializers.ModelSerializer):
 
 class BankingDetailSerializer(serializers.ModelSerializer):
     account_type_display = serializers.CharField(source="get_account_type_display", read_only=True)
-    banking_status_display = serializers.CharField(source="get_banking_status_display", read_only=True)
-    verification_status_display = serializers.CharField(
-        source="get_verification_status_display",
-        read_only=True,
-    )
+    # banking_status_display = serializers.CharField(source="get_banking_status_display", read_only=True)
+    # verification_status_display = serializers.CharField(
+    #     source="get_verification_status_display",
+    #     read_only=True,
+    # )
 
     class Meta:
         model = BankingDetail
@@ -276,13 +276,13 @@ class BankingDetailSerializer(serializers.ModelSerializer):
             "ifsc_code",
             "account_type",
             "account_type_display",
-            "banking_status",
-            "banking_status_display",
-            "verification_status",
-            "verification_status_display",
-            "is_primary",
-            "is_verified",
-            "created_at",
-            "updated_at",
+            # "banking_status",
+            # "banking_status_display",
+            # "verification_status",
+            # # "verification_status_display",
+            # "is_primary",
+            # # "is_verified",
+            # "created_at",
+            # "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
