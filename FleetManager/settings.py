@@ -97,7 +97,9 @@ INSTALLED_APPS = [
     'users',
     'configuration',
     'rest_framework',
-    'drf_spectacular'
+    'drf_spectacular',
+    'corsheaders',
+    'django_extensions'
 ]
 
 MIDDLEWARE = [
@@ -108,7 +110,15 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    "corsheaders.middleware.CorsMiddleware",
+    "django.middleware.common.CommonMiddleware",
+
 ]
+
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+]
+
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [],
