@@ -15,6 +15,7 @@ urlpatterns = [
 
     # API Version 1
     # path('v1/auth/', include('api.v1.auth.urls')),
+    path('v1/configuration/', include('api.v1.configuration.urls')),
     path('v1/entity/', include('api.v1.entity.urls')),
     path('v1/operations/', include('api.v1.operations.urls')),
     path('v1/financial/', include('api.v1.financial.urls')),

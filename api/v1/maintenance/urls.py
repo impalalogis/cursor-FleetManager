@@ -1,29 +1,17 @@
 """
-Maintenance API URLs.
+Maintenance API URLs powered by DRF router.
 """
 
-from django.urls import path
+from django.urls import include, path
+from rest_framework.routers import DefaultRouter
 
-from .views import (
-    MaintenanceDueSoon,
-    MaintenanceOverdue,
-    MaintenanceRecordDetail,
-    MaintenanceRecordListCreate,
-    TyreDetail,
-    TyreListCreate,
-    TyreNeedsReplacement,
-    TyreTransactionDetail,
-    TyreTransactionListCreate,
-)
+from .views import MaintenanceRecordViewSet, TyreTransactionViewSet, TyreViewSet
+
+router = DefaultRouter()
+router.register(r"maintenance-records", MaintenanceRecordViewSet, basename="maint-record")
+router.register(r"tyres", TyreViewSet, basename="maint-tyre")
+router.register(r"tyre-transactions", TyreTransactionViewSet, basename="maint-tyre-transaction")
 
 urlpatterns = [
-    path("maintenance-records/", MaintenanceRecordListCreate.as_view(), name="maintenance-record-list-create"),
-    path("maintenance-records/<int:pk>/", MaintenanceRecordDetail.as_view(), name="maintenance-record-detail"),
-    path("maintenance-records/due-soon/", MaintenanceDueSoon.as_view(), name="maintenance-record-due-soon"),
-    path("maintenance-records/overdue/", MaintenanceOverdue.as_view(), name="maintenance-record-overdue"),
-    path("tyres/", TyreListCreate.as_view(), name="tyre-list-create"),
-    path("tyres/<int:pk>/", TyreDetail.as_view(), name="tyre-detail"),
-    path("tyres/needs-replacement/", TyreNeedsReplacement.as_view(), name="tyre-needs-replacement"),
-    path("tyre-transactions/", TyreTransactionListCreate.as_view(), name="tyre-transaction-list-create"),
-    path("tyre-transactions/<int:pk>/", TyreTransactionDetail.as_view(), name="tyre-transaction-detail"),
+    path("", include(router.urls)),
 ]
